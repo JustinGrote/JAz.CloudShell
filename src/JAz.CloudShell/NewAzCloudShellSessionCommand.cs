@@ -63,6 +63,7 @@ public sealed class NewAzCloudShellSessionCommand : PSCmdlet
             }
 
             progress.StatusDescription = "Opening the PowerShell remoting session";
+            progress.PercentComplete = 90;
             WriteProgress(progress);
             var connectionInfo = new AzCloudShellConnectionInfo(channel);
             runspace = RunspaceFactory.CreateRunspace(connectionInfo, Host, TypeTable.LoadDefaultTypeFiles(), null, Name);
@@ -90,6 +91,7 @@ public sealed class NewAzCloudShellSessionCommand : PSCmdlet
                 throw new CloudShellException("Session", $"The Azure Cloud Shell remoting session could not be opened: {state.Reason?.Message ?? state.State.ToString()}", inner: state.Reason);
             }
 
+            progress.PercentComplete = 100;
             progress.RecordType = ProgressRecordType.Completed;
             WriteProgress(progress);
             WriteObject(PSSession.Create(runspace, "AzCloudShell", this));
@@ -137,9 +139,28 @@ public sealed class NewAzCloudShellSessionCommand : PSCmdlet
             {
                 WriteVerbose(message);
                 progress.StatusDescription = message;
+                progress.PercentComplete = AdvancePercent(progress.PercentComplete, message);
                 WriteProgress(progress);
             }
         }
+    }
+
+    // Retry and fallback messages keep the current value so the bar never moves backwards.
+    internal static int AdvancePercent(int current, string message)
+    {
+        var phase = message switch
+        {
+            _ when message.StartsWith("Acquiring an Azure Resource Manager token", StringComparison.Ordinal) => 5,
+            _ when message.StartsWith("Reading Cloud Shell user settings", StringComparison.Ordinal) => 15,
+            _ when message.StartsWith("Requesting a Cloud Shell console", StringComparison.Ordinal) => 25,
+            _ when message.StartsWith("Reusing the existing Cloud Shell console", StringComparison.Ordinal) => 30,
+            _ when message.StartsWith("Creating a bash terminal", StringComparison.Ordinal) => 40,
+            _ when message.StartsWith("Connecting to the Cloud Shell terminal WebSocket", StringComparison.Ordinal) => 50,
+            _ when message.StartsWith("Waiting for the Cloud Shell bash prompt", StringComparison.Ordinal) => 60,
+            _ when message.StartsWith("Starting PowerShell in server mode", StringComparison.Ordinal) => 75,
+            _ => -1,
+        };
+        return Math.Max(current, phase);
     }
 
     private async Task<CloudShellBridgeChannel> ConnectAsync(Action<string> log, CancellationToken ct)

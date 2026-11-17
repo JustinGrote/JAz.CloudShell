@@ -119,4 +119,29 @@ public class ProtocolTests
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken) =>
             Task.FromResult(respond(request));
     }
+
+    [Fact]
+    public void ConnectionProgress_AdvancesByPhaseAndNeverMovesBackwards()
+    {
+        var percent = -1;
+        var seen = new List<int>();
+        foreach (var message in new[]
+        {
+            "Reusing the existing Cloud Shell console.",
+            "Could not reuse the Cloud Shell console (gone); requesting it again.",
+            "Acquiring an Azure Resource Manager token with DefaultAzureCredential.",
+            "Reading Cloud Shell user settings.",
+            "Requesting a Cloud Shell console.",
+            "Creating a bash terminal.",
+            "Connecting to the Cloud Shell terminal WebSocket.",
+            "Waiting for the Cloud Shell bash prompt.",
+            "Starting PowerShell in server mode (pwsh -s).",
+        })
+        {
+            percent = NewAzCloudShellSessionCommand.AdvancePercent(percent, message);
+            seen.Add(percent);
+        }
+
+        Assert.Equal([30, 30, 30, 30, 30, 40, 50, 60, 75], seen);
+    }
 }
