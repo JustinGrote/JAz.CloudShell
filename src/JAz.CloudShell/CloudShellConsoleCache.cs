@@ -4,7 +4,7 @@ using Azure.Core;
 namespace JAz.CloudShell;
 
 /// <summary>
-/// Remembers the access token and Cloud Shell console per tenant for this process, so later sessions only create a new
+/// Remembers the access token and Cloud Shell console per authentication identity for this process, so later sessions only create a new
 /// terminal in the running console instead of authenticating and provisioning again.
 /// </summary>
 internal static class CloudShellConsoleCache
@@ -22,8 +22,19 @@ internal static class CloudShellConsoleCache
         int columns,
         int rows,
         Action<string> log,
-        CancellationToken ct)
+        CancellationToken ct,
+        string tokenSource = "DefaultAzureCredential",
+        bool cacheToken = true)
     {
+        var refreshAfter = DateTimeOffset.UtcNow + TokenRefreshMargin;
+        foreach (var entry in Entries)
+        {
+            if (entry.Value.Token.ExpiresOn <= refreshAfter)
+            {
+                Entries.TryRemove(entry);
+            }
+        }
+
         if (Entries.TryGetValue(key, out var cached) && cached.Token.ExpiresOn - DateTimeOffset.UtcNow > TokenRefreshMargin)
         {
             log("Reusing the existing Cloud Shell console.");
@@ -40,12 +51,16 @@ internal static class CloudShellConsoleCache
             }
         }
 
-        log("Acquiring an Azure Resource Manager token with DefaultAzureCredential.");
+        log($"Acquiring an Azure Resource Manager token with {tokenSource}.");
         var token = await getToken(ct).ConfigureAwait(false);
         var client = new CloudShellClient(http, token.Token, log);
         var consoleUri = await client.ProvisionConsoleAsync(ct).ConfigureAwait(false);
         var webSocketUri = await client.CreateTerminalAsync(consoleUri, columns, rows, ct).ConfigureAwait(false);
-        Entries[key] = new Entry(token, consoleUri);
+        if (cacheToken && token.ExpiresOn > DateTimeOffset.UtcNow + TokenRefreshMargin)
+        {
+            Entries[key] = new Entry(token, consoleUri);
+        }
+
         return (webSocketUri, false);
     }
 

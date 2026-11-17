@@ -4,6 +4,7 @@ using Xunit;
 
 namespace JAz.CloudShell.Tests;
 
+[Collection("CloudShell transport")]
 public class ProtocolTests
 {
     [Fact]

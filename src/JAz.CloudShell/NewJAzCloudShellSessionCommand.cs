@@ -8,11 +8,11 @@ namespace JAz.CloudShell;
 
 /// <summary>
 /// <para type="synopsis">Creates a PowerShell remoting session to Azure Cloud Shell.</para>
-/// <para type="description">Authenticates with DefaultAzureCredential, opens an Azure Cloud Shell bash terminal over its
+/// <para type="description">Authenticates with DefaultAzureCredential, supplied Az.Accounts contexts, or a supplied secure access token, opens an Azure Cloud Shell bash terminal over its
 /// WebSocket (reusing the console and token of earlier sessions in this process when possible), starts PowerShell in server mode (pwsh -s) in that terminal, and carries PowerShell remoting over the
 /// server's stdin and stdout. Use the returned PSSession with Invoke-Command, Enter-PSSession, and Remove-PSSession.</para>
 /// </summary>
-[Cmdlet(VerbsCommon.New, "JAzCloudShellSession")]
+[Cmdlet(VerbsCommon.New, "JAzCloudShellSession", DefaultParameterSetName = "Default")]
 [OutputType(typeof(PSSession))]
 public sealed class NewJAzCloudShellSessionCommand : PSCmdlet
 {
@@ -21,6 +21,7 @@ public sealed class NewJAzCloudShellSessionCommand : PSCmdlet
 
     /// <summary>Test hook: connect to this terminal WebSocket instead of provisioning Azure Cloud Shell.</summary>
     internal static Uri? WebSocketUriOverride;
+    internal static Func<HttpClient>? HttpClientFactoryOverride;
 
     private readonly CancellationTokenSource _stop = new();
 
@@ -30,9 +31,23 @@ public sealed class NewJAzCloudShellSessionCommand : PSCmdlet
     public string? Name { get; set; }
 
     /// <summary>Optional Microsoft Entra tenant ID used by DefaultAzureCredential.</summary>
-    [Parameter]
+    [Parameter(ParameterSetName = "Default")]
     [ValidateNotNullOrEmpty]
     public string? TenantId { get; set; }
+
+    /// <summary>Skip the silent WAM check and use DefaultAzureCredential directly.</summary>
+    [Parameter(ParameterSetName = "Default")]
+    public SwitchParameter NoWAM { get; set; }
+
+    /// <summary>Az.Accounts IAzureContextContainer objects identifying the accounts and tenants to connect.</summary>
+    [Parameter(ParameterSetName = "Context", Mandatory = true, ValueFromPipeline = true)]
+    [ValidateNotNullOrEmpty]
+    public PSObject[]? Context { get; set; }
+
+    /// <summary>An Az.Accounts PSSecureAccessToken or a SecureString containing an ARM access token.</summary>
+    [Parameter(ParameterSetName = "AccessToken", Mandatory = true)]
+    [ValidateNotNull]
+    public PSObject? AccessToken { get; set; }
 
     /// <summary>Maximum seconds allowed for authentication, Cloud Shell provisioning, bootstrap, and session opening.</summary>
     [Parameter]
@@ -41,18 +56,85 @@ public sealed class NewJAzCloudShellSessionCommand : PSCmdlet
 
     protected override void ProcessRecord()
     {
+        if (Context is null)
+        {
+            CreateSession(null);
+            return;
+        }
+
+        foreach (var context in Context)
+        {
+            CreateSession(context);
+        }
+    }
+
+    private void CreateSession(PSObject? context)
+    {
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(ConnectingTimeout));
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(timeout.Token, _stop.Token);
         var ct = linked.Token;
-        var messages = new BlockingCollection<string>();
-        var progress = new ProgressRecord(0x4A5A, "Connecting to Azure Cloud Shell", "Starting");
+        using var messages = new BlockingCollection<Action>();
+        var progress = new ProgressRecord(0x4A5A, "Connecting to Azure Cloud Shell", "Starting") { PercentComplete = 0 };
+        PSObject? profile = null;
+        void Log(string message) => messages.Add(() =>
+        {
+            WriteVerbose(message);
+            progress.StatusDescription = message;
+            progress.PercentComplete = AdvancePercent(progress.PercentComplete, message);
+            WriteProgress(progress);
+        }, ct);
 
-        var connect = Task.Run(() => ConnectAsync(messages.Add, ct), ct);
+        ValueTask<AccessToken> GetContextToken(CancellationToken token)
+        {
+            var request = new TaskCompletionSource<AccessToken>(TaskCreationOptions.RunContinuationsAsynchronously);
+            // Nested PowerShell commands must run on the pipeline thread, not the connection worker.
+            messages.Add(() =>
+            {
+                if (token.IsCancellationRequested)
+                {
+                    request.TrySetCanceled(token);
+                    return;
+                }
+
+                try
+                {
+                    request.TrySetResult(AzContextAuthentication.GetToken(profile!, token));
+                }
+                catch (Exception ex)
+                {
+                    request.TrySetException(ex);
+                }
+            }, token);
+            return new ValueTask<AccessToken>(request.Task.WaitAsync(token));
+        }
+
+        Task<CloudShellBridgeChannel>? connect = null;
         CloudShellBridgeChannel? channel = null;
         Runspace? runspace = null;
         try
         {
-            PumpMessages(connect, messages, progress);
+            var cacheKey = $"default:{(NoWAM.IsPresent ? "no-wam" : "wam")}:{TenantId}";
+            var tokenSource = "DefaultAzureCredential";
+            Func<CancellationToken, ValueTask<Azure.Core.AccessToken>>? getToken = null;
+            var cacheToken = true;
+            if (AccessToken is not null)
+            {
+                var supplied = SuppliedAccessToken.Read(AccessToken);
+                cacheKey = supplied.CacheKey;
+                getToken = _ => ValueTask.FromResult(supplied.Token);
+                tokenSource = "the supplied access token";
+                cacheToken = supplied.CacheToken;
+            }
+            else if (context is not null)
+            {
+                profile = AzContextAuthentication.ConvertProfile(context);
+                cacheKey = AzContextAuthentication.GetCacheKey(profile);
+                getToken = GetContextToken;
+                tokenSource = "Az.Accounts for the supplied context";
+            }
+
+            connect = Task.Run(() => ConnectAsync(cacheKey, getToken, tokenSource, cacheToken, Log, ct), ct);
+            PumpMessages(connect, messages);
             try
             {
                 channel = connect.GetAwaiter().GetResult();
@@ -92,8 +174,7 @@ public sealed class NewJAzCloudShellSessionCommand : PSCmdlet
             }
 
             progress.PercentComplete = 100;
-            progress.RecordType = ProgressRecordType.Completed;
-            WriteProgress(progress);
+            progress.StatusDescription = "Connected";
             WriteObject(PSSession.Create(runspace, "AzCloudShell", this));
             runspace = null;
             channel = null;
@@ -108,20 +189,31 @@ public sealed class NewJAzCloudShellSessionCommand : PSCmdlet
             var category = ex switch
             {
                 AuthenticationFailedException or CredentialUnavailableException => ErrorCategory.AuthenticationError,
+                ArgumentException => ErrorCategory.InvalidArgument,
                 TimeoutException => ErrorCategory.OperationTimeout,
                 CloudShellException { StatusCode: System.Net.HttpStatusCode.Forbidden or System.Net.HttpStatusCode.Unauthorized } => ErrorCategory.PermissionDenied,
                 _ => ErrorCategory.ConnectionError,
             };
-            var message = ex is AuthenticationFailedException or CredentialUnavailableException
+            var message = context is null && AccessToken is null && ex is (AuthenticationFailedException or CredentialUnavailableException)
                 ? $"DefaultAzureCredential could not obtain an Azure token. Sign in with Azure CLI (az login), Azure PowerShell (Connect-AzAccount), or another supported developer credential. {ex.Message}"
                 : ex.Message;
-            ThrowTerminatingError(new ErrorRecord(new CloudShellException("Connect", message, inner: ex), "AzCloudShellConnectFailed", category, null));
+            var error = new ErrorRecord(new CloudShellException("Connect", message, inner: ex), "AzCloudShellConnectFailed", category, context);
+            if (context is null)
+            {
+                ThrowTerminatingError(error);
+            }
+            else
+            {
+                WriteError(error);
+            }
         }
         finally
         {
             runspace?.Dispose();
             channel?.Dispose();
-            if (!connect.IsCompleted)
+            progress.RecordType = ProgressRecordType.Completed;
+            WriteProgress(progress);
+            if (connect is { IsCompleted: false })
             {
                 // Make sure a late-completing connection is not leaked.
                 _ = connect.ContinueWith(t => t.Result.Dispose(), TaskContinuationOptions.OnlyOnRanToCompletion);
@@ -131,16 +223,13 @@ public sealed class NewJAzCloudShellSessionCommand : PSCmdlet
 
     protected override void StopProcessing() => _stop.Cancel();
 
-    private void PumpMessages(Task connect, BlockingCollection<string> messages, ProgressRecord progress)
+    private static void PumpMessages(Task connect, BlockingCollection<Action> messages)
     {
         while (!connect.IsCompleted || messages.Count > 0)
         {
-            if (messages.TryTake(out var message, 100))
+            if (messages.TryTake(out var action, 100))
             {
-                WriteVerbose(message);
-                progress.StatusDescription = message;
-                progress.PercentComplete = AdvancePercent(progress.PercentComplete, message);
-                WriteProgress(progress);
+                action();
             }
         }
     }
@@ -163,25 +252,31 @@ public sealed class NewJAzCloudShellSessionCommand : PSCmdlet
         return Math.Max(current, phase);
     }
 
-    private async Task<CloudShellBridgeChannel> ConnectAsync(Action<string> log, CancellationToken ct)
+    private async Task<CloudShellBridgeChannel> ConnectAsync(
+        string cacheKey,
+        Func<CancellationToken, ValueTask<AccessToken>>? getSuppliedToken,
+        string tokenSource,
+        bool cacheToken,
+        Action<string> log,
+        CancellationToken ct)
     {
-        if (WebSocketUriOverride is { } overrideUri)
+        if (WebSocketUriOverride is { } overrideUri && HttpClientFactoryOverride is null)
         {
             return await OpenTerminalAsync(overrideUri, log, ct).ConfigureAwait(false);
         }
 
-        var cacheKey = TenantId ?? string.Empty;
-        using var http = new HttpClient(new SocketsHttpHandler { AllowAutoRedirect = false }) { Timeout = TimeSpan.FromSeconds(100) };
-        var credential = new Lazy<DefaultAzureCredential>(() => new DefaultAzureCredential(new DefaultAzureCredentialOptions { TenantId = TenantId }));
+        using var http = HttpClientFactoryOverride?.Invoke()
+            ?? new HttpClient(new SocketsHttpHandler { AllowAutoRedirect = false }) { Timeout = TimeSpan.FromSeconds(100) };
         ValueTask<AccessToken> GetToken(CancellationToken token) =>
-            credential.Value.GetTokenAsync(new TokenRequestContext([CloudShellClient.ArmScope], tenantId: TenantId), token);
+            DefaultAuthentication.GetTokenAsync(TenantId, NoWAM.IsPresent, log, token);
 
         while (true)
         {
-            var (webSocketUri, reused) = await CloudShellConsoleCache.CreateTerminalAsync(cacheKey, GetToken, http, TerminalColumns, TerminalRows, log, ct).ConfigureAwait(false);
+            var (webSocketUri, reused) = await CloudShellConsoleCache.CreateTerminalAsync(
+                cacheKey, getSuppliedToken ?? GetToken, http, TerminalColumns, TerminalRows, log, ct, tokenSource, cacheToken).ConfigureAwait(false);
             try
             {
-                return await OpenTerminalAsync(webSocketUri, log, ct).ConfigureAwait(false);
+                return await OpenTerminalAsync(WebSocketUriOverride ?? webSocketUri, log, ct).ConfigureAwait(false);
             }
             catch (CloudShellException ex) when (reused && !ct.IsCancellationRequested)
             {

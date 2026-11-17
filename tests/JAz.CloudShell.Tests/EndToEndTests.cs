@@ -285,6 +285,7 @@ internal sealed class FakeTerminalServer : IDisposable
     }
 }
 
+[Collection("CloudShell transport")]
 public sealed class EndToEndTests : IDisposable
 {
     private readonly FakeTerminalServer _server = new();
@@ -312,7 +313,7 @@ public sealed class EndToEndTests : IDisposable
     [Fact]
     public void InvokeCommand_RunsInTheTerminalPowerShellProcess()
     {
-        Run("$global:s = New-JAzCloudShellSession -Name e2e -ConnectingTimeout 120");
+        Run("$global:s = New-JAzCloudShellSession -Name e2e -NoWAM -ConnectingTimeout 120");
 
         var pid = Run("Invoke-Command -Session $s { $PID }");
         Assert.Equal(_server.LastProcessId, (int)pid.Single().BaseObject);
@@ -358,6 +359,230 @@ public sealed class EndToEndTests : IDisposable
         Run("Remove-PSSession $s");
         AssertEventually(() => _server.StoppedServers == 1 && _server.ClosedConnections == 1, "Remove-PSSession did not close the terminal.");
     }
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Contexts_SelectTokensAndIsolateConsolesForArraysAndPipeline(bool pipeline)
+    {
+        SetUpContextAuthentication();
+        Run(pipeline
+            ? "$global:sessions = @($profiles[0], $profiles[1], $profiles[2], $profiles[0]) | New-JAzCloudShellSession"
+            : "$global:sessions = New-JAzCloudShellSession -Context @($profiles[0], $profiles[1], $profiles[2], $profiles[0])");
+
+        Assert.Equal(["4", "3", "alice", "bob", "alice"], Run("$sessions.Count; $tokenRequests.Count; $tokenRequests.Account").Select(o => o.ToString()));
+        Assert.Equal(["tenant", "tenant", "other-tenant"], Run("$tokenRequests.Tenant").Select(o => o.ToString()));
+        Assert.Equal(4, (int)Run("@(Invoke-Command -Session $sessions { $PID } | Select-Object -Unique).Count").Single().BaseObject);
+        Assert.Equal(["token-alice-tenant", "token-bob-tenant", "token-alice-other-tenant", "token-alice-tenant"], _terminalTokens);
+        Run("$sessions | Remove-PSSession");
+        AssertEventually(() => _server.StoppedServers == 4 && _server.ClosedConnections == 4, "Context sessions did not close their terminals.");
+    }
+
+    [Fact]
+    public void ContextFailure_ReportsAnErrorAndContinuesWithTheNextProfile()
+    {
+        SetUpContextAuthentication();
+        _ps.Commands.Clear();
+        _ps.AddScript("$global:sessions = New-JAzCloudShellSession -Context @('not a profile', $profiles[0]) -ErrorAction Continue");
+        _ps.Invoke();
+        Assert.Single(_ps.Streams.Error);
+        Assert.Equal(["1", "alice"], Run("@($sessions).Count; $tokenRequests.Account").Select(o => o.ToString()));
+        Run("$sessions | Remove-PSSession");
+    }
+
+    [Fact]
+    public void ContextTokenFailure_DoesNotFallBackToAnotherCredential()
+    {
+        SetUpContextAuthentication();
+        Run("$global:failToken = $true");
+        _ps.Commands.Clear();
+        _ps.AddScript("New-JAzCloudShellSession -Context $profiles[0] -ErrorAction Continue");
+        Assert.Empty(_ps.Invoke());
+        Assert.Single(_ps.Streams.Error);
+        Assert.Contains("context token failed", _ps.Streams.Error[0].ToString());
+        Assert.Empty(_terminalTokens);
+    }
+
+    [Fact]
+    public void ContextTokenRequest_ObservesTheConnectionTimeout()
+    {
+        SetUpContextAuthentication();
+        Run("$global:delayToken = $true");
+        _ps.Commands.Clear();
+        _ps.AddScript("New-JAzCloudShellSession -Context $profiles[0] -ConnectingTimeout 1 -ErrorAction Continue");
+        var timer = Stopwatch.StartNew();
+        Assert.Empty(_ps.Invoke());
+        Assert.Single(_ps.Streams.Error);
+        Assert.Contains("did not complete within 1 seconds", _ps.Streams.Error[0].ToString());
+        Assert.True(timer.Elapsed < TimeSpan.FromSeconds(10), "Token acquisition ignored the connection timeout.");
+        Assert.Empty(_terminalTokens);
+    }
+
+    [Fact]
+    public void AccessToken_AcceptsSecureStringWithoutLoadingAzAccounts()
+    {
+        SetUpTokenAuthentication();
+        Run("""
+            $token = ConvertTo-SecureString 'provided-raw-token' -AsPlainText -Force
+            $global:sessions = @(
+                New-JAzCloudShellSession -AccessToken $token
+                New-JAzCloudShellSession -AccessToken $token
+            )
+            """);
+
+        Assert.Empty(Run("Get-Module Az.Accounts"));
+        Assert.Equal(["provided-raw-token", "provided-raw-token"], _terminalTokens);
+        Assert.Equal(2, _requestMethods.Count(m => m == "PUT"));
+        Assert.Equal(["2"], Run("@(Invoke-Command -Session $sessions { $PID } | Select-Object -Unique).Count").Select(o => o.ToString()));
+        Run("$sessions | Remove-PSSession");
+        AssertEventually(() => _server.StoppedServers == 2 && _server.ClosedConnections == 2, "Supplied-token sessions did not close.");
+    }
+
+    [Fact]
+    public void AccessToken_ReadsPSSecureAccessTokenAndReusesOnlyTheMatchingToken()
+    {
+        SetUpSecureTokenObjects();
+        Run("""
+            $global:sessions = @(
+                New-JAzCloudShellSession -AccessToken $tokens[0]
+                New-JAzCloudShellSession -AccessToken $tokens[1]
+                New-JAzCloudShellSession -AccessToken $tokens[0]
+            )
+            """);
+
+        Assert.Equal(["provided-first-token", "provided-second-token", "provided-first-token"], _terminalTokens);
+        Assert.Equal(2, _requestMethods.Count(m => m == "PUT"));
+        Assert.Equal(["3"], Run("@(Invoke-Command -Session $sessions { $PID } | Select-Object -Unique).Count").Select(o => o.ToString()));
+        Run("$sessions | Remove-PSSession");
+        AssertEventually(() => _server.StoppedServers == 3 && _server.ClosedConnections == 3, "Supplied-token sessions did not close.");
+    }
+
+    [Fact]
+    public void AccessToken_RejectsExpiredTokenWithoutCredentialFallback()
+    {
+        SetUpSecureTokenObjects();
+        Run("$tokens[0].ExpiresOn = [DateTimeOffset]::UtcNow.AddMinutes(-1)");
+        _ps.Commands.Clear();
+        _ps.AddScript("New-JAzCloudShellSession -AccessToken $tokens[0]");
+        Assert.Empty(_ps.Invoke());
+        var error = Assert.Single(_ps.Streams.Error);
+        Assert.Contains("expired", error.ToString());
+        Assert.DoesNotContain("DefaultAzureCredential", error.ToString());
+        Assert.Empty(_requestMethods);
+    }
+
+    [Theory]
+    [InlineData("'provided-plaintext-token'")]
+    [InlineData("[Security.SecureString]::new()")]
+    [InlineData("ConvertTo-SecureString 'provided whitespace-token' -AsPlainText -Force")]
+    public void AccessToken_RejectsInvalidInputWithoutDisclosingIt(string input)
+    {
+        SetUpTokenAuthentication();
+        _ps.AddScript($"New-JAzCloudShellSession -AccessToken ({input})");
+        Assert.Empty(_ps.Invoke());
+        var error = Assert.Single(_ps.Streams.Error);
+        Assert.Contains("AccessToken", error.ToString());
+        Assert.DoesNotContain("provided", error.ToString());
+        Assert.Empty(_requestMethods);
+    }
+
+    [Theory]
+    [InlineData("-Context ([pscustomobject]@{})")]
+    [InlineData("-TenantId 'tenant'")]
+    [InlineData("-NoWAM")]
+    public void AccessToken_HasASeparateParameterSet(string otherParameter)
+    {
+        SetUpTokenAuthentication();
+        _ps.AddScript($"New-JAzCloudShellSession -AccessToken ([Security.SecureString]::new()) {otherParameter}");
+        Assert.Empty(_ps.Invoke());
+        Assert.Contains("AmbiguousParameterSet", Assert.Single(_ps.Streams.Error).FullyQualifiedErrorId);
+        Assert.Empty(_requestMethods);
+    }
+
+    private readonly List<string> _terminalTokens = [];
+    private readonly List<string> _requestMethods = [];
+
+    private void SetUpTokenAuthentication() =>
+        NewJAzCloudShellSessionCommand.HttpClientFactoryOverride = () => new HttpClient(new ContextHttpHandler(_terminalTokens, _requestMethods));
+
+    private void SetUpSecureTokenObjects()
+    {
+        Assert.SkipWhen((bool)Run("@(Get-Module -ListAvailable Az.Accounts).Count -eq 0").Single().BaseObject,
+            "PSSecureAccessToken integration tests require Az.Accounts.");
+        Run("""
+            Import-Module Az.Accounts -ErrorAction Stop
+            $global:tokens = @('provided-first-token', 'provided-second-token') | ForEach-Object {
+                $token = [Microsoft.Azure.Commands.Profile.Models.PSSecureAccessToken]::new()
+                $token.Token = ConvertTo-SecureString $_ -AsPlainText -Force
+                $token.ExpiresOn = [DateTimeOffset]::UtcNow.AddHours(1)
+                $token
+            }
+            """);
+        SetUpTokenAuthentication();
+    }
+
+    private void SetUpContextAuthentication()
+    {
+        Assert.SkipWhen((bool)Run("@(Get-Module -ListAvailable Az.Accounts).Count -eq 0").Single().BaseObject,
+            "Context integration tests require Az.Accounts.");
+        Run("""
+            Import-Module Az.Accounts -ErrorAction Stop
+            $global:tokenRequests = [Collections.Generic.List[object]]::new()
+            $global:failToken = $false
+            $global:delayToken = $false
+            $global:profiles = @('alice', 'bob', 'alice') | ForEach-Object {
+                $context = [Microsoft.Azure.Commands.Common.Authentication.Abstractions.AzureContext]::new()
+                $context.Account = [Microsoft.Azure.Commands.Common.Authentication.Abstractions.AzureAccount]::new()
+                $context.Account.Id = $_
+                $context.Account.Type = 'User'
+                $context.Tenant = [Microsoft.Azure.Commands.Common.Authentication.Abstractions.AzureTenant]::new()
+                $context.Tenant.Id = 'tenant'
+                $context.Environment = [Microsoft.Azure.Commands.Common.Authentication.Abstractions.AzureEnvironment]::PublicEnvironments['AzureCloud']
+                $profile = [Microsoft.Azure.Commands.Common.Authentication.Models.AzureRmProfile]::new()
+                $profile.DefaultContext = $context
+                $profile
+            }
+            $profiles[2].DefaultContext.Tenant.Id = 'other-tenant'
+            New-Module -Name Az.Accounts -ScriptBlock {
+                function Get-AzAccessToken {
+                    param($DefaultProfile, $ResourceTypeName, [switch]$AsSecureString)
+                    if ($global:failToken) { throw 'context token failed' }
+                    if ($global:delayToken) { Start-Sleep -Seconds 30 }
+                    if ($ResourceTypeName -ne 'Arm' -or -not $AsSecureString) { throw 'Incorrect token request' }
+                    $global:tokenRequests.Add([pscustomobject]@{
+                        Account = $DefaultProfile.DefaultContext.Account.Id
+                        Tenant = $DefaultProfile.DefaultContext.Tenant.Id
+                    })
+                    [pscustomobject]@{
+                        Token = ConvertTo-SecureString "token-$($DefaultProfile.DefaultContext.Account.Id)-$($DefaultProfile.DefaultContext.Tenant.Id)" -AsPlainText -Force
+                        ExpiresOn = [DateTimeOffset]::UtcNow.AddHours(1)
+                    }
+                }
+                Export-ModuleMember -Function Get-AzAccessToken
+            } | Import-Module -Force
+            """);
+        SetUpTokenAuthentication();
+    }
+
+    private sealed class ContextHttpHandler(List<string> terminalTokens, List<string> methods) : HttpMessageHandler
+    {
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            methods.Add(request.Method.Method);
+            if (request.Method == HttpMethod.Post)
+            {
+                terminalTokens.Add(request.Headers.Authorization!.Parameter!);
+            }
+
+            var json = request.Method.Method switch
+            {
+                "PUT" => """{"properties":{"uri":"https://ux.console.azure.com/c/test/"}}""",
+                "POST" => """{"id":"terminal"}""",
+                _ => "{}",
+            };
+            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent(json) });
+        }
+    }
+
     private static void AssertEventually(Func<bool> condition, string message)
     {
         var sw = Stopwatch.StartNew();
@@ -373,5 +598,7 @@ public sealed class EndToEndTests : IDisposable
         _ps.Dispose();
         _server.Dispose();
         NewJAzCloudShellSessionCommand.WebSocketUriOverride = null;
+        NewJAzCloudShellSessionCommand.HttpClientFactoryOverride = null;
+        CloudShellConsoleCache.Clear();
     }
 }
