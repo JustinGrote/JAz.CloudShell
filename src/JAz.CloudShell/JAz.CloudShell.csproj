@@ -19,6 +19,7 @@
 
   <ItemGroup>
     <None Include="JAz.CloudShell.psd1" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\..\LICENSE" Link="LICENSE" CopyToOutputDirectory="PreserveNewest" />
     <InternalsVisibleTo Include="JAz.CloudShell.Tests" />
   </ItemGroup>
 
