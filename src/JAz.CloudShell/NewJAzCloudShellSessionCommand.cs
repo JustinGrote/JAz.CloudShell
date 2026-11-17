@@ -12,9 +12,9 @@ namespace JAz.CloudShell;
 /// WebSocket (reusing the console and token of earlier sessions in this process when possible), starts PowerShell in server mode (pwsh -s) in that terminal, and carries PowerShell remoting over the
 /// server's stdin and stdout. Use the returned PSSession with Invoke-Command, Enter-PSSession, and Remove-PSSession.</para>
 /// </summary>
-[Cmdlet(VerbsCommon.New, "AzCloudShellSession")]
+[Cmdlet(VerbsCommon.New, "JAzCloudShellSession")]
 [OutputType(typeof(PSSession))]
-public sealed class NewAzCloudShellSessionCommand : PSCmdlet
+public sealed class NewJAzCloudShellSessionCommand : PSCmdlet
 {
     private const int TerminalColumns = 240;
     private const int TerminalRows = 50;

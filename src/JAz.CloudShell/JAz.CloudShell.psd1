@@ -6,7 +6,7 @@
     Description          = 'PowerShell remoting (PSSession) transport over the Azure Cloud Shell terminal WebSocket.'
     PowerShellVersion    = '7.6'
     CompatiblePSEditions = @('Core')
-    CmdletsToExport      = @('New-AzCloudShellSession')
+    CmdletsToExport      = @('New-JAzCloudShellSession')
     FunctionsToExport    = @()
     AliasesToExport      = @()
     VariablesToExport    = @()

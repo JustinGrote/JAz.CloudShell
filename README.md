@@ -1,11 +1,11 @@
 # JAz.CloudShell
 
-A custom PowerShell remoting transport for **Azure Cloud Shell**. `New-AzCloudShellSession` returns a normal
+A custom PowerShell remoting transport for **Azure Cloud Shell**. `New-JAzCloudShellSession` returns a normal
 `PSSession`, so you can use the usual remoting commands with it:
 
 ```powershell
 Import-Module ./out/JAz.CloudShell
-$cs = New-AzCloudShellSession -Verbose
+$cs = New-JAzCloudShellSession -Verbose
 Invoke-Command -Session $cs { $PID; $PSVersionTable.PSVersion; Get-AzContext }
 Enter-PSSession $cs
 Remove-PSSession $cs
@@ -83,4 +83,4 @@ Windows. The real `bash`/`stty` launcher is only exercised in Cloud Shell. Linux
 ```
 
 The tests need `pwsh` on `PATH`. The end-to-end test starts a loopback WebSocket "terminal" backed by a real `pwsh`
-server-mode process and runs `New-AzCloudShellSession` and `Invoke-Command` against it.
+server-mode process and runs `New-JAzCloudShellSession` and `Invoke-Command` against it.

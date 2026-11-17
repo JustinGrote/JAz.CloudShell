@@ -138,7 +138,7 @@ public class ProtocolTests
             "Starting PowerShell in server mode (pwsh -s).",
         })
         {
-            percent = NewAzCloudShellSessionCommand.AdvancePercent(percent, message);
+            percent = NewJAzCloudShellSessionCommand.AdvancePercent(percent, message);
             seen.Add(percent);
         }
 

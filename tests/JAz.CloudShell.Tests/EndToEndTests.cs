@@ -292,9 +292,9 @@ public sealed class EndToEndTests : IDisposable
 
     public EndToEndTests()
     {
-        NewAzCloudShellSessionCommand.WebSocketUriOverride = _server.Uri;
+        NewJAzCloudShellSessionCommand.WebSocketUriOverride = _server.Uri;
         var iss = InitialSessionState.CreateDefault2();
-        iss.Commands.Add(new SessionStateCmdletEntry("New-AzCloudShellSession", typeof(NewAzCloudShellSessionCommand), null));
+        iss.Commands.Add(new SessionStateCmdletEntry("New-JAzCloudShellSession", typeof(NewJAzCloudShellSessionCommand), null));
         _ps = PowerShell.Create(iss);
     }
 
@@ -312,7 +312,7 @@ public sealed class EndToEndTests : IDisposable
     [Fact]
     public void InvokeCommand_RunsInTheTerminalPowerShellProcess()
     {
-        Run("$global:s = New-AzCloudShellSession -Name e2e -ConnectingTimeout 120");
+        Run("$global:s = New-JAzCloudShellSession -Name e2e -ConnectingTimeout 120");
 
         var pid = Run("Invoke-Command -Session $s { $PID }");
         Assert.Equal(_server.LastProcessId, (int)pid.Single().BaseObject);
@@ -344,7 +344,7 @@ public sealed class EndToEndTests : IDisposable
     [Fact]
     public void DisconnectPSSession_IsRejectedAndKeepsTheSessionUsable()
     {
-        Run("$global:s = New-AzCloudShellSession -ConnectingTimeout 120");
+        Run("$global:s = New-JAzCloudShellSession -ConnectingTimeout 120");
 
         // PowerShell only supports disconnecting WSMan sessions, so the session stays connected and usable.
         _ps.Commands.Clear();
@@ -372,6 +372,6 @@ public sealed class EndToEndTests : IDisposable
     {
         _ps.Dispose();
         _server.Dispose();
-        NewAzCloudShellSessionCommand.WebSocketUriOverride = null;
+        NewJAzCloudShellSessionCommand.WebSocketUriOverride = null;
     }
 }
