@@ -13,7 +13,7 @@ internal static class Bootstrapper
     {
         var nonce = Convert.ToHexString(RandomNumberGenerator.GetBytes(8));
 
-        log("Waiting for the Cloud Shell PowerShell prompt.");
+        log("Waiting for the Cloud Shell bash prompt.");
         await WaitForPromptAsync(channel, ct).ConfigureAwait(false);
 
         // The marker is assembled by printf so the terminal's echo of the command never matches it.
@@ -34,7 +34,7 @@ internal static class Bootstrapper
             }
             catch (TimeoutException)
             {
-                // A line typed before PSReadLine reads input is lost. If an earlier attempt did start, this retry is
+                // The line may not have reached the shell. If an earlier attempt did start, this retry is
                 // discarded by the server's input filter, which drops everything before the start line.
             }
         }
@@ -50,26 +50,22 @@ internal static class Bootstrapper
     /// </summary>
     internal static string BuildLaunchCommand(string nonce)
     {
-        var script =
+        // Run in a subshell so the loop variable doesn't leak, and keep the command out of the saved bash history.
+        return "unset HISTFILE; (" +
             "stty raw -echo; " +
             $"printf \"~JZ%s%s~\\n\" R {nonce}; " +
             $"{{ while IFS= read -r l; do case \"$l\" in *{CloudShellBridgeChannel.StartLine(nonce)}*) break;; esac; done; " +
             $"while IFS= read -r l; do [ \"$l\" = \"{CloudShellBridgeChannel.StopLine(nonce)}\" ] && break; printf \"%s\\n\" \"$l\"; done; }} " +
-            "| \"$JZPS\" -NoLogo -NoProfile -s 2>&1 | cat; " +
+            "| pwsh -NoLogo -NoProfile -s 2>&1 | cat; " +
             "stty sane; " +
-            $"printf \"~JZ%s%s~\\n\" C {nonce}";
-
-        return "try { Set-PSReadLineOption -HistorySaveStyle SaveNothing -PredictionSource None } catch { }; " +
-            "$env:JZPS = [Environment]::ProcessPath; " +
-            $"bash -c '{script}'; " +
-            "Remove-Item env:JZPS\r";
+            $"printf \"~JZ%s%s~\\n\" C {nonce})\r";
     }
 
     private static async Task WaitForPromptAsync(CloudShellBridgeChannel channel, CancellationToken ct)
     {
-        // Cloud Shell's pwsh can take most of a minute to start; text typed before it reads input is only echoed by
-        // the TTY and then lost. PSReadLine querying the cursor position (or a visible prompt) means it is reading.
-        var prompt = new Regex(@"PS [^\r\n]*> ?$");
+        // Wait for the bash prompt (e.g. "user [ ~ ]$ ") and for the terminal to go quiet, so the launch line isn't
+        // mixed into Cloud Shell's startup output.
+        var prompt = new Regex(@"[$#] ?$");
         var start = DateTime.UtcNow;
         DateTime? readyAt = null;
         while (DateTime.UtcNow - start < TimeSpan.FromSeconds(150))

@@ -71,10 +71,10 @@ internal sealed class CloudShellClient
             }
         }
 
-        _log("Creating a PowerShell terminal.");
+        _log("Creating a bash terminal.");
         using var terminal = await SendAsync("Terminal", () =>
         {
-            var r = NewRequest(HttpMethod.Post, new Uri(cloudShellUri, $"terminals?cols={columns}&rows={rows}&version=2019-01-01&shell=pwsh"));
+            var r = NewRequest(HttpMethod.Post, new Uri(cloudShellUri, $"terminals?cols={columns}&rows={rows}&version=2019-01-01&shell=bash"));
             r.Headers.Referrer = cloudShellUri;
             r.Content = new StringContent("{}", Encoding.UTF8, "application/json");
             return r;
