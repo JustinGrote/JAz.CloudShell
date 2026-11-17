@@ -3,6 +3,7 @@ using System.Management.Automation;
 using System.Management.Automation.Runspaces;
 using Azure.Core;
 using Azure.Identity;
+using Microsoft.Azure.Commands.Common.Authentication.Abstractions.Core;
 
 namespace JAz.CloudShell;
 
@@ -75,7 +76,7 @@ public sealed class NewJAzCloudShellSessionCommand : PSCmdlet
         var ct = linked.Token;
         using var messages = new BlockingCollection<Action>();
         var progress = new ProgressRecord(0x4A5A, "Connecting to Azure Cloud Shell", "Starting") { PercentComplete = 0 };
-        PSObject? profile = null;
+        IAzureContextContainer? profile = null;
         void Log(string message) => messages.Add(() =>
         {
             WriteVerbose(message);

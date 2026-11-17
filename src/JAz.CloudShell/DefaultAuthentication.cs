@@ -21,7 +21,6 @@ internal static class DefaultAuthentication
         return GetTokenAsync(broker, () => new DefaultAzureCredential(new DefaultAzureCredentialOptions
         {
             TenantId = tenantId,
-            ExcludeBrokerCredential = true,
             ExcludeInteractiveBrowserCredential = true,
         }), new TokenRequestContext([CloudShellClient.ArmScope], tenantId: tenantId), log, ct);
     }

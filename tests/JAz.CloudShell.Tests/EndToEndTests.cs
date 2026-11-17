@@ -293,10 +293,11 @@ public sealed class EndToEndTests : IDisposable
 
     public EndToEndTests()
     {
-        NewJAzCloudShellSessionCommand.WebSocketUriOverride = _server.Uri;
         var iss = InitialSessionState.CreateDefault2();
+        iss.ImportPSModule(["Az.Accounts"]);
         iss.Commands.Add(new SessionStateCmdletEntry("New-JAzCloudShellSession", typeof(NewJAzCloudShellSessionCommand), null));
         _ps = PowerShell.Create(iss);
+        NewJAzCloudShellSessionCommand.WebSocketUriOverride = _server.Uri;
     }
 
     private Collection<PSObject> Run(string script)
@@ -402,6 +403,21 @@ public sealed class EndToEndTests : IDisposable
         Assert.Empty(_terminalTokens);
     }
 
+    [Theory]
+    [InlineData("invalid")]
+    [InlineData("expired")]
+    public void ContextTokenRequest_RejectsInvalidNativeTokenResults(string mode)
+    {
+        SetUpContextAuthentication();
+        Run($"$global:tokenMode = '{mode}'");
+        _ps.Commands.Clear();
+        _ps.AddScript("New-JAzCloudShellSession -Context $profiles[0] -ErrorAction Continue");
+        Assert.Empty(_ps.Invoke());
+        var error = Assert.Single(_ps.Streams.Error);
+        Assert.Contains(mode == "invalid" ? "valid secure access token" : "expired access token", error.ToString());
+        Assert.Empty(_terminalTokens);
+    }
+
     [Fact]
     public void ContextTokenRequest_ObservesTheConnectionTimeout()
     {
@@ -418,7 +434,7 @@ public sealed class EndToEndTests : IDisposable
     }
 
     [Fact]
-    public void AccessToken_AcceptsSecureStringWithoutLoadingAzAccounts()
+    public void AccessToken_AcceptsSecureStringWithRequiredAzAccountsModule()
     {
         SetUpTokenAuthentication();
         Run("""
@@ -429,7 +445,7 @@ public sealed class EndToEndTests : IDisposable
             )
             """);
 
-        Assert.Empty(Run("Get-Module Az.Accounts"));
+        Assert.Single(Run("Get-Module Az.Accounts"));
         Assert.Equal(["provided-raw-token", "provided-raw-token"], _terminalTokens);
         Assert.Equal(2, _requestMethods.Count(m => m == "PUT"));
         Assert.Equal(["2"], Run("@(Invoke-Command -Session $sessions { $PID } | Select-Object -Unique).Count").Select(o => o.ToString()));
@@ -529,6 +545,7 @@ public sealed class EndToEndTests : IDisposable
             $global:tokenRequests = [Collections.Generic.List[object]]::new()
             $global:failToken = $false
             $global:delayToken = $false
+            $global:tokenMode = ''
             $global:profiles = @('alice', 'bob', 'alice') | ForEach-Object {
                 $context = [Microsoft.Azure.Commands.Common.Authentication.Abstractions.AzureContext]::new()
                 $context.Account = [Microsoft.Azure.Commands.Common.Authentication.Abstractions.AzureAccount]::new()
@@ -547,15 +564,22 @@ public sealed class EndToEndTests : IDisposable
                     param($DefaultProfile, $ResourceTypeName, [switch]$AsSecureString)
                     if ($global:failToken) { throw 'context token failed' }
                     if ($global:delayToken) { Start-Sleep -Seconds 30 }
+                    if ($global:tokenMode -eq 'invalid') {
+                        return [pscustomobject]@{
+                            Token = ConvertTo-SecureString 'not-a-native-token' -AsPlainText -Force
+                            ExpiresOn = [DateTimeOffset]::UtcNow.AddHours(1)
+                        }
+                    }
                     if ($ResourceTypeName -ne 'Arm' -or -not $AsSecureString) { throw 'Incorrect token request' }
                     $global:tokenRequests.Add([pscustomobject]@{
                         Account = $DefaultProfile.DefaultContext.Account.Id
                         Tenant = $DefaultProfile.DefaultContext.Tenant.Id
                     })
-                    [pscustomobject]@{
-                        Token = ConvertTo-SecureString "token-$($DefaultProfile.DefaultContext.Account.Id)-$($DefaultProfile.DefaultContext.Tenant.Id)" -AsPlainText -Force
-                        ExpiresOn = [DateTimeOffset]::UtcNow.AddHours(1)
-                    }
+                    $token = [Microsoft.Azure.Commands.Profile.Models.PSSecureAccessToken]::new()
+                    $token.Token = ConvertTo-SecureString "token-$($DefaultProfile.DefaultContext.Account.Id)-$($DefaultProfile.DefaultContext.Tenant.Id)" -AsPlainText -Force
+                    $token.ExpiresOn = [DateTimeOffset]::UtcNow.AddHours(1)
+                    if ($global:tokenMode -eq 'expired') { $token.ExpiresOn = [DateTimeOffset]::UtcNow.AddMinutes(-1) }
+                    $token
                 }
                 Export-ModuleMember -Function Get-AzAccessToken
             } | Import-Module -Force

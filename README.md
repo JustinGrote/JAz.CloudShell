@@ -42,6 +42,8 @@ Remove-PSSession $cs
 ## Requirements
 
 - PowerShell 7.6 or later (.NET 10) locally, on Windows, Linux, or macOS.
+- Az.Accounts 5.3.3 or later (`Install-Module Az.Accounts -MinimumVersion 5.3.3`). It is imported automatically and
+  supplies Azure.Identity, Azure.Identity.Broker, and their runtime dependencies; this module does not bundle them.
 - A Cloud Shell account that is already onboarded in the public Azure cloud. Open https://shell.azure.com once to set it
   up. The module never onboards an account or changes your Cloud Shell settings.
 
@@ -69,7 +71,7 @@ $sessions = $profiles | New-JAzCloudShellSession
 
 Each profile produces one session using its default context's account and tenant. A failed profile reports an error
 and processing continues with the remaining profiles, unless `-ErrorAction Stop` is specified. The connection timeout
-applies separately to each profile. Az.Accounts is only needed when `-Context` is supplied.
+applies separately to each profile.
 
 Cloud Shell can reject Azure PowerShell-issued tokens with `ClientNotAllowed`. This service restriction is reported
 unchanged; supplying a profile does not bypass it or silently substitute an Azure CLI identity. Omit `-Context` to use
@@ -88,7 +90,7 @@ $cs = New-JAzCloudShellSession -AccessToken $token.Token
 The object form reads the secure string from `Token` and honors `ExpiresOn`; expired tokens are rejected locally.
 Provide the full token object for expiry-aware console reuse. A bare `SecureString` has no expiry metadata.
 Tokens are never automatically refreshed or replaced with another credential. Plaintext strings are not accepted.
-Supplying a `SecureString` does not require Az.Accounts. The token must be valid for public Azure Resource Manager
+The token must be valid for public Azure Resource Manager
 and come from a client permitted by Cloud Shell; `-AccessToken` does not bypass the service's client restrictions.
 
 ## Limitations
@@ -131,6 +133,8 @@ Windows. The real `bash`/`stty` launcher is only exercised in Cloud Shell. Linux
 
 Build and intermediate outputs use .NET's centralized artifacts layout under `Artifacts\bin` and `Artifacts\obj`.
 NuGet package versions are managed centrally in `Directory.Packages.props`.
+Building requires Az.Accounts 5.3.3 or later installed for the native context and token reference assemblies.
+MSBuild discovers the installed module automatically; use `-p:AzAccountsModulePath=<module-directory>` to override it.
 Published modules go to `Artifacts\publish\JAz.CloudShell\<configuration>`, and the build script writes test results
 to `Artifacts\TestResults\<configuration>`. Debug and Release outputs are kept separate.
 

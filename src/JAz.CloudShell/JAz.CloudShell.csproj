@@ -14,8 +14,9 @@
   <ItemGroup>
     <!-- Compile against the PowerShell 7.6 API baseline; PowerShell itself provides SMA at runtime. -->
     <PackageReference Include="System.Management.Automation" PrivateAssets="all" ExcludeAssets="runtime" />
-    <PackageReference Include="Azure.Identity" />
-    <PackageReference Include="Azure.Identity.Broker" />
+    <!-- Az.Accounts supplies these assemblies and their dependencies at runtime. -->
+    <PackageReference Include="Azure.Identity" PrivateAssets="all" ExcludeAssets="runtime" />
+    <PackageReference Include="Azure.Identity.Broker" PrivateAssets="all" ExcludeAssets="runtime" />
   </ItemGroup>
 
   <ItemGroup>
@@ -30,5 +31,27 @@
     <NuGetAuditSuppress Include="https://github.com/advisories/GHSA-2fmv-rv2c-59x7" />
     <NuGetAuditSuppress Include="https://github.com/advisories/GHSA-846f-f764-76mx" />
   </ItemGroup>
+
+  <Target Name="ResolveAzAccountsReferences" BeforeTargets="ResolveAssemblyReferences">
+    <Exec Condition="'$(AzAccountsModulePath)' == ''"
+          Command="pwsh -NoProfile -NonInteractive -Command &quot;$ErrorActionPreference = 'Stop'; $module = Get-Module -ListAvailable Az.Accounts | Where-Object Version -GE ([version]'5.3.3') | Sort-Object Version -Descending | Select-Object -First 1; if (-not $module) { throw 'Building requires Az.Accounts 5.3.3 or later.' }; $module.ModuleBase&quot;"
+          ConsoleToMSBuild="true" StandardOutputImportance="Low">
+      <Output TaskParameter="ConsoleOutput" PropertyName="AzAccountsModulePath" />
+    </Exec>
+    <Error Condition="!Exists('$(AzAccountsModulePath)\Microsoft.Azure.PowerShell.Authentication.Abstractions.dll')"
+           Text="Az.Accounts reference assemblies were not found in '$(AzAccountsModulePath)'." />
+    <ItemGroup>
+      <Reference Include="Microsoft.Azure.PowerShell.Authentication.Abstractions">
+        <HintPath>$(AzAccountsModulePath)\Microsoft.Azure.PowerShell.Authentication.Abstractions.dll</HintPath>
+        <Private>false</Private>
+        <ExternallyResolved>true</ExternallyResolved>
+      </Reference>
+      <Reference Include="Microsoft.Azure.PowerShell.Cmdlets.Accounts">
+        <HintPath>$(AzAccountsModulePath)\Microsoft.Azure.PowerShell.Cmdlets.Accounts.dll</HintPath>
+        <Private>false</Private>
+        <ExternallyResolved>true</ExternallyResolved>
+      </Reference>
+    </ItemGroup>
+  </Target>
 
 </Project>
