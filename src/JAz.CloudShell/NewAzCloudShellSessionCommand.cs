@@ -8,8 +8,8 @@ namespace JAz.CloudShell;
 
 /// <summary>
 /// <para type="synopsis">Creates a PowerShell remoting session to Azure Cloud Shell.</para>
-/// <para type="description">Authenticates with DefaultAzureCredential, opens an Azure Cloud Shell PowerShell terminal over its
-/// WebSocket, starts PowerShell in server mode (pwsh -s) in that terminal, and carries PowerShell remoting over the
+/// <para type="description">Authenticates with DefaultAzureCredential, opens an Azure Cloud Shell bash terminal over its
+/// WebSocket (reusing the console and token of earlier sessions in this process when possible), starts PowerShell in server mode (pwsh -s) in that terminal, and carries PowerShell remoting over the
 /// server's stdin and stdout. Use the returned PSSession with Invoke-Command, Enter-PSSession, and Remove-PSSession.</para>
 /// </summary>
 [Cmdlet(VerbsCommon.New, "AzCloudShellSession")]
@@ -144,20 +144,34 @@ public sealed class NewAzCloudShellSessionCommand : PSCmdlet
 
     private async Task<CloudShellBridgeChannel> ConnectAsync(Action<string> log, CancellationToken ct)
     {
-        Uri webSocketUri;
         if (WebSocketUriOverride is { } overrideUri)
         {
-            webSocketUri = overrideUri;
-        }
-        else
-        {
-            log("Acquiring an Azure Resource Manager token with DefaultAzureCredential.");
-            var credential = new DefaultAzureCredential(new DefaultAzureCredentialOptions { TenantId = TenantId });
-            var token = await credential.GetTokenAsync(new TokenRequestContext([CloudShellClient.ArmScope], tenantId: TenantId), ct).ConfigureAwait(false);
-            using var http = new HttpClient(new SocketsHttpHandler { AllowAutoRedirect = false }) { Timeout = TimeSpan.FromSeconds(100) };
-            webSocketUri = await new CloudShellClient(http, token.Token, log).ProvisionTerminalAsync(TerminalColumns, TerminalRows, ct).ConfigureAwait(false);
+            return await OpenTerminalAsync(overrideUri, log, ct).ConfigureAwait(false);
         }
 
+        var cacheKey = TenantId ?? string.Empty;
+        using var http = new HttpClient(new SocketsHttpHandler { AllowAutoRedirect = false }) { Timeout = TimeSpan.FromSeconds(100) };
+        var credential = new Lazy<DefaultAzureCredential>(() => new DefaultAzureCredential(new DefaultAzureCredentialOptions { TenantId = TenantId }));
+        ValueTask<AccessToken> GetToken(CancellationToken token) =>
+            credential.Value.GetTokenAsync(new TokenRequestContext([CloudShellClient.ArmScope], tenantId: TenantId), token);
+
+        while (true)
+        {
+            var (webSocketUri, reused) = await CloudShellConsoleCache.CreateTerminalAsync(cacheKey, GetToken, http, TerminalColumns, TerminalRows, log, ct).ConfigureAwait(false);
+            try
+            {
+                return await OpenTerminalAsync(webSocketUri, log, ct).ConfigureAwait(false);
+            }
+            catch (CloudShellException ex) when (reused && !ct.IsCancellationRequested)
+            {
+                log($"The reused Cloud Shell console did not respond ({ex.Message}); requesting it again.");
+                CloudShellConsoleCache.Invalidate(cacheKey);
+            }
+        }
+    }
+
+    private static async Task<CloudShellBridgeChannel> OpenTerminalAsync(Uri webSocketUri, Action<string> log, CancellationToken ct)
+    {
         log("Connecting to the Cloud Shell terminal WebSocket.");
         var channel = await CloudShellBridgeChannel.ConnectAsync(webSocketUri, ct).ConfigureAwait(false);
         try

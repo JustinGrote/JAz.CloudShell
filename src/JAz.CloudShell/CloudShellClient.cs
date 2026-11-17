@@ -45,7 +45,8 @@ internal sealed class CloudShellClient
         _log = log;
     }
 
-    public async Task<Uri> ProvisionTerminalAsync(int columns, int rows, CancellationToken ct)
+        /// <summary>Ensures the user's Cloud Shell console is running and returns its URI.</summary>
+    public async Task<Uri> ProvisionConsoleAsync(CancellationToken ct)
     {
         _log("Reading Cloud Shell user settings.");
         using (var settings = await SendAsync("UserSettings", () => NewRequest(HttpMethod.Get, new Uri($"{ArmEndpoint}providers/Microsoft.Portal/userSettings/cloudconsole?api-version={ApiVersion}")), ct, notFoundMessage:
@@ -54,7 +55,6 @@ internal sealed class CloudShellClient
         }
 
         _log("Requesting a Cloud Shell console.");
-        Uri cloudShellUri;
         using (var console = await SendAsync("Provisioning", () =>
         {
             var r = NewRequest(HttpMethod.Put, new Uri($"{ArmEndpoint}providers/Microsoft.Portal/consoles/default?api-version={ApiVersion}"));
@@ -64,13 +64,14 @@ internal sealed class CloudShellClient
         {
             var uriText = TryGetString(console.Json, "properties", "uri")
                 ?? throw new CloudShellException("Provisioning", "Azure did not return a Cloud Shell console URI.", requestId: console.RequestId);
-            cloudShellUri = ValidateServiceUri(uriText, Uri.UriSchemeHttps, "Provisioning");
-            if (!cloudShellUri.AbsoluteUri.EndsWith('/'))
-            {
-                cloudShellUri = new Uri(cloudShellUri.AbsoluteUri + "/");
-            }
+            var cloudShellUri = ValidateServiceUri(uriText, Uri.UriSchemeHttps, "Provisioning");
+            return cloudShellUri.AbsoluteUri.EndsWith('/') ? cloudShellUri : new Uri(cloudShellUri.AbsoluteUri + "/");
         }
+    }
 
+    /// <summary>Creates a bash terminal in a running console and returns its WebSocket URI.</summary>
+    public async Task<Uri> CreateTerminalAsync(Uri cloudShellUri, int columns, int rows, CancellationToken ct)
+    {
         _log("Creating a bash terminal.");
         using var terminal = await SendAsync("Terminal", () =>
         {

@@ -34,6 +34,16 @@ internal sealed class FakeTerminalServer : IDisposable
 
     public int? LastProcessId { get; private set; }
 
+    /// <summary>Number of server-mode processes the client has stopped with the stop line.</summary>
+    public int StoppedServers => _stoppedServers;
+
+    private int _stoppedServers;
+
+    /// <summary>Number of terminal WebSockets the client has closed.</summary>
+    public int ClosedConnections => _closedConnections;
+
+    private int _closedConnections;
+
     public string StdErr
     {
         get
@@ -79,7 +89,7 @@ internal sealed class FakeTerminalServer : IDisposable
     }
 
     /// <summary>
-    /// Emulates the Cloud Shell terminal: an interactive pwsh prompt that echoes input until the launch line arrives,
+    /// Emulates the Cloud Shell terminal: an interactive bash prompt that echoes input until the launch line arrives,
     /// then the bash launcher (raw TTY, discard input until the start line, forward lines to <c>pwsh -s</c> until the
     /// stop line, print the exit marker). The server-mode pwsh is real.
     /// </summary>
@@ -103,8 +113,8 @@ internal sealed class FakeTerminalServer : IDisposable
         Task? relay = null;
         try
         {
-            // Look like PSReadLine at an idle prompt, which queries the cursor position before reading input.
-            await SendAsync("PS /home/test> \e[6n"u8.ToArray());
+            // Look like Cloud Shell bash at an idle prompt.
+            await SendAsync("\e]0;test\a\e[?2004htest [ ~ ]$ "u8.ToArray());
 
             var buffer = new byte[16384];
             var pending = new StringBuilder();
@@ -116,13 +126,20 @@ internal sealed class FakeTerminalServer : IDisposable
                 var result = await ws.ReceiveAsync(buffer, _cts.Token);
                 if (result.MessageType == WebSocketMessageType.Close)
                 {
+                    Interlocked.Increment(ref _closedConnections);
                     break;
+                }
+
+                if (stopped)
+                {
+                    // Back at the bash prompt; ignore input until the client closes the socket.
+                    continue;
                 }
 
                 var text = Encoding.UTF8.GetString(buffer, 0, result.Count);
                 if (nonce is null)
                 {
-                    // Interactive prompt: PSReadLine consumes cursor reports and echoes typed text.
+                    // Interactive prompt: readline echoes typed text; a stray cursor report is dropped.
                     text = text.Replace("\e[1;1R", string.Empty, StringComparison.Ordinal);
                     await SendAsync(Encoding.UTF8.GetBytes(text));
                     pending.Append(text);
@@ -214,18 +231,17 @@ internal sealed class FakeTerminalServer : IDisposable
                     {
                         stdin.Close();
                         stopped = true;
+                        Interlocked.Increment(ref _stoppedServers);
                         break;
                     }
 
                     await stdin.WriteAsync(l + "\n");
                 }
 
-                if (stopped)
+                if (!stopped)
                 {
-                    break;
+                    await stdin.FlushAsync();
                 }
-
-                await stdin.FlushAsync();
             }
         }
         catch
@@ -322,6 +338,34 @@ public sealed class EndToEndTests : IDisposable
         Assert.Equal(_server.LastProcessId, (int)Run("Invoke-Command -Session $s { $PID }").Single().BaseObject);
 
         Run("Remove-PSSession $s");
+        AssertEventually(() => _server.StoppedServers == 1 && _server.ClosedConnections == 1, "Remove-PSSession did not close the terminal.");
+    }
+
+    [Fact]
+    public void DisconnectPSSession_IsRejectedAndKeepsTheSessionUsable()
+    {
+        Run("$global:s = New-AzCloudShellSession -ConnectingTimeout 120");
+
+        // PowerShell only supports disconnecting WSMan sessions, so the session stays connected and usable.
+        _ps.Commands.Clear();
+        _ps.Streams.Error.Clear();
+        _ps.AddScript("Disconnect-PSSession $s");
+        _ps.Invoke();
+        Assert.Contains(_ps.Streams.Error, e => e.ToString().Contains("not supported"));
+        Assert.Equal(["Opened", "1"], Run("$s.State; Invoke-Command -Session $s { 1 }").Select(o => o.ToString()));
+        Assert.Equal(0, _server.ClosedConnections);
+
+        Run("Remove-PSSession $s");
+        AssertEventually(() => _server.StoppedServers == 1 && _server.ClosedConnections == 1, "Remove-PSSession did not close the terminal.");
+    }
+    private static void AssertEventually(Func<bool> condition, string message)
+    {
+        var sw = Stopwatch.StartNew();
+        while (!condition())
+        {
+            Assert.True(sw.Elapsed < TimeSpan.FromSeconds(10), message);
+            Thread.Sleep(100);
+        }
     }
 
     public void Dispose()

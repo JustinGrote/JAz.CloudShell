@@ -18,10 +18,9 @@ Remove-PSSession $cs
 2. **Provisioning.** The flow is the one Devolutions Terminal uses, and it matches Windows Terminal:
    1. `GET userSettings/cloudconsole`
    2. `PUT consoles/default` with `osType: linux`
-   3. `POST {cloudShellUri}/terminals?shell=pwsh`
+   3. `POST {cloudShellUri}/terminals?shell=bash` (a bash terminal starts much faster than one that loads the pwsh profile)
    4. Connect to the terminal WebSocket (handles both direct and Azure Relay endpoints).
-3. **Server mode.** Once PSReadLine is reading input, the cmdlet types one line at the interactive Cloud Shell prompt.
-   That line runs a short `bash -c` launcher that:
+3. **Server mode.** Once the bash prompt appears, the cmdlet types one launcher line at it. The launcher:
    - switches the TTY to raw mode with no echo, so PSRP passes through unchanged
    - starts `pwsh -NoLogo -NoProfile -s` (PowerShell's built-in remoting server mode), with stdin and stdout/stderr
      connected through pipes so .NET never treats them as a terminal
@@ -52,11 +51,17 @@ Remove-PSSession $cs
   process and the Cloud Shell profile isn't loaded. Closing the session ends the server and returns the terminal to
   its prompt. If the WebSocket drops, the session becomes Broken. It does not reconnect, and
   commands are never replayed.
-- Each session uses one Cloud Shell terminal. Cloud Shell's own idle timeout (about 20 minutes) still applies.
+- Each session uses its own Cloud Shell terminal. Within one PowerShell process, later sessions for the same tenant
+  reuse the Cloud Shell console and access token (while the token has at least 5 minutes left) and only create a new
+  terminal. If the cached console is gone, the cmdlet provisions a fresh one automatically. Cloud Shell's own idle
+  timeout (about 20 minutes) still applies.
+- console reuse for a second session, `Remove-PSSession`, and the `Disconnect-PSSession` error stops the remote `pwsh -s` and closes the WebSocket. `Disconnect-PSSession` isn't supported:
+  PowerShell only allows disconnect for WSMan sessions, so it reports an error and the session stays open and usable.
 - Sovereign clouds aren't supported.
-- Starting a fresh Cloud Shell usually takes about a minute, mostly while its `pwsh` loads the profile. The cmdlet
-  waits for PSReadLine to start reading input before it types anything, and it answers the terminal's cursor-position
-  queries (`ESC[6n`) the way a terminal emulator would.
+- Starting a session takes a few seconds with a warm Cloud Shell (about 7 s for the first session and 2 s for a
+  session that reuses the console). A cold Cloud Shell container takes longer. The cmdlet waits for the bash prompt
+  before it types anything, and it answers the terminal's cursor-position queries (`ESC[6n`) the way a terminal
+  emulator would.
 
 ## Validation
 
@@ -65,7 +70,7 @@ client. These all worked:
 - `$PID` (the `pwsh -s` process) and `$using:` with Unicode text
 - 20,000 lines of output (about 4 s) and a 300 KB argument (under 1 s)
 - remote errors, native commands, and the Cloud Shell Az context
-- `Remove-PSSession`
+- console reuse for a second session, `Remove-PSSession`, and the `Disconnect-PSSession` error
 
 The automated end-to-end test emulates the terminal and the launcher, and runs PSRP against a real `pwsh -s` on
 Windows. The real `bash`/`stty` launcher is only exercised in Cloud Shell. Linux and macOS clients haven't been tested.

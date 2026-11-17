@@ -110,7 +110,7 @@ internal sealed class CloudShellBridgeChannel : IDisposable
     {
         lock (_sync)
         {
-            return Regex.Replace(_text.ToString(), @"\e\[[0-9;?]*[A-Za-z]|\e[=>]", string.Empty);
+            return Regex.Replace(_text.ToString(), @"\e\][^\a\e]*(?:\a|\e\\)|\e\[[0-9;?]*[A-Za-z]|\e[=>]", string.Empty);
         }
     }
 

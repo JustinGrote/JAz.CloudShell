@@ -47,16 +47,76 @@ public class ProtocolTests
     public void BuildLaunchCommand_StartsServerModeWithoutEchoingMarkers()
     {
         var command = Bootstrapper.BuildLaunchCommand("CAFE");
-        var script = Regex.Match(command, "bash -c '([^']*)';").Groups[1].Value;
 
         Assert.EndsWith("\r", command);
         Assert.DoesNotContain('\n', command);
-        Assert.Contains("-NoLogo -NoProfile -s 2>&1", script);
-        Assert.Contains("JZSTARTCAFE", script);
-        Assert.Contains("\"JZSTOPCAFE\"", script);
+        Assert.Contains("| pwsh -NoLogo -NoProfile -s 2>&1", command);
+        Assert.Contains("JZSTARTCAFE", command);
+        Assert.Contains("\"JZSTOPCAFE\"", command);
 
         // The terminal echoes the typed command; only the printf output may contain the markers.
         Assert.DoesNotContain("~JZRCAFE~", command);
         Assert.DoesNotContain("~JZCCAFE~", command);
+    }
+
+    [Fact]
+    public async Task ConsoleCache_ReusesConsoleAndTokenAndRecoversWhenConsoleIsGone()
+    {
+        CloudShellConsoleCache.Clear();
+        var requests = new List<string>();
+        var tokens = 0;
+        var failNextTerminal = false;
+        using var http = new HttpClient(new StubHandler(request =>
+        {
+            requests.Add(request.Method.Method);
+            if (request.Method == HttpMethod.Post && failNextTerminal)
+            {
+                failNextTerminal = false;
+                return new HttpResponseMessage(System.Net.HttpStatusCode.NotFound);
+            }
+
+            return new HttpResponseMessage(System.Net.HttpStatusCode.OK)
+            {
+                Content = new StringContent(request.Method.Method switch
+                {
+                    "PUT" => """{"properties":{"uri":"https://ux.console.azure.com/c/cc-1"}}""",
+                    "POST" => """{"id":"t1"}""",
+                    _ => "{}",
+                }),
+            };
+        }));
+        ValueTask<Azure.Core.AccessToken> GetToken(CancellationToken ct)
+        {
+            tokens++;
+            return ValueTask.FromResult(new Azure.Core.AccessToken("token", DateTimeOffset.UtcNow.AddHours(1)));
+        }
+
+        Task<(Uri WebSocketUri, bool Reused)> Create() => CloudShellConsoleCache.CreateTerminalAsync("tenant", GetToken, http, 80, 24, _ => { }, CancellationToken.None);
+        try
+        {
+            var first = await Create();
+            Assert.Equal(("wss://ux.console.azure.com/c/cc-1/terminals/t1", false), (first.WebSocketUri.AbsoluteUri, first.Reused));
+            Assert.Equal(["GET", "PUT", "POST"], requests);
+
+            requests.Clear();
+            Assert.True((await Create()).Reused);
+            Assert.Equal(["POST"], requests);
+
+            requests.Clear();
+            failNextTerminal = true;
+            Assert.False((await Create()).Reused);
+            Assert.Equal(["POST", "GET", "PUT", "POST"], requests);
+            Assert.Equal(2, tokens);
+        }
+        finally
+        {
+            CloudShellConsoleCache.Clear();
+        }
+    }
+
+    private sealed class StubHandler(Func<HttpRequestMessage, HttpResponseMessage> respond) : HttpMessageHandler
+    {
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken) =>
+            Task.FromResult(respond(request));
     }
 }
