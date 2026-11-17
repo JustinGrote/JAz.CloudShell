@@ -12,7 +12,7 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
 $artifacts = Join-Path $PSScriptRoot 'Artifacts'
-$out = Join-Path $artifacts 'publish' 'JAz.CloudShell' $Configuration.ToLowerInvariant()
+$out = Join-Path $artifacts 'JAz.CloudShell'
 if (Test-Path $out) { Remove-Item $out -Recurse -Force }
 
 dotnet publish (Join-Path $PSScriptRoot 'src' 'JAz.CloudShell') -c $Configuration -o $out --nologo
