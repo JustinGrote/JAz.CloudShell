@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Management.Automation;
 using System.Management.Automation.Runspaces;
+using System.Security;
 using Azure.Core;
 using Azure.Identity;
 using Microsoft.Azure.Commands.Common.Authentication.Abstractions.Core;
@@ -9,8 +10,8 @@ namespace JAz.CloudShell;
 
 /// <summary>
 /// <para type="synopsis">Creates a PowerShell remoting session to Azure Cloud Shell.</para>
-/// <para type="description">Authenticates with DefaultAzureCredential, supplied Az.Accounts contexts, or a supplied secure access token, opens an Azure Cloud Shell bash terminal over its
-/// WebSocket (reusing the console and token of earlier sessions in this process when possible), starts PowerShell in server mode (pwsh -s) in that terminal, and carries PowerShell remoting over the
+/// <para type="description">Authenticates with EnvironmentCredential, VisualStudioCodeCredential, AzureCliCredential, then the Windows broker by default, or only the credential selected by -CredentialSource, supplied Az.Accounts contexts, or a supplied secure access token, opens an Azure Cloud Shell bash terminal over its
+/// WebSocket (provisioning a console and creating a new terminal for each session), starts PowerShell in server mode (pwsh -s) in that terminal, and carries PowerShell remoting over the
 /// server's stdin and stdout. Use the returned PSSession with Invoke-Command, Enter-PSSession, and Remove-PSSession.</para>
 /// </summary>
 [Cmdlet(VerbsCommon.New, "JAzCloudShellSession", DefaultParameterSetName = "Default")]
@@ -31,24 +32,24 @@ public sealed class NewJAzCloudShellSessionCommand : PSCmdlet
     [ValidateNotNullOrEmpty]
     public string? Name { get; set; }
 
-    /// <summary>Optional Microsoft Entra tenant ID used by DefaultAzureCredential.</summary>
+    /// <summary>Optional Microsoft Entra tenant ID for the default credential search's token request.</summary>
     [Parameter(ParameterSetName = "Default")]
     [ValidateNotNullOrEmpty]
     public string? TenantId { get; set; }
 
-    /// <summary>Skip the silent WAM check and use DefaultAzureCredential directly.</summary>
+    /// <summary>Use only the selected source instead of searching credentials in order.</summary>
     [Parameter(ParameterSetName = "Default")]
-    public SwitchParameter NoWAM { get; set; }
+    public AzureCredentialSource? CredentialSource { get; set; }
 
     /// <summary>Az.Accounts IAzureContextContainer objects identifying the accounts and tenants to connect.</summary>
     [Parameter(ParameterSetName = "Context", Mandatory = true, ValueFromPipeline = true)]
     [ValidateNotNullOrEmpty]
     public PSObject[]? Context { get; set; }
 
-    /// <summary>An Az.Accounts PSSecureAccessToken or a SecureString containing an ARM access token.</summary>
+    /// <summary>A SecureString containing an ARM access token.</summary>
     [Parameter(ParameterSetName = "AccessToken", Mandatory = true)]
     [ValidateNotNull]
-    public PSObject? AccessToken { get; set; }
+    public SecureString? AccessToken { get; set; }
 
     /// <summary>Maximum seconds allowed for authentication, Cloud Shell provisioning, bootstrap, and session opening.</summary>
     [Parameter]
@@ -114,27 +115,26 @@ public sealed class NewJAzCloudShellSessionCommand : PSCmdlet
         Runspace? runspace = null;
         try
         {
-            var cacheKey = $"default:{(NoWAM.IsPresent ? "no-wam" : "wam")}:{TenantId}";
-            var tokenSource = "DefaultAzureCredential";
+            var credentialSource = CredentialSource;
+            var tokenSource = credentialSource is { } selectedSource
+                ? $"the {selectedSource} credential source"
+                : "the default Azure credential search";
             Func<CancellationToken, ValueTask<Azure.Core.AccessToken>>? getToken = null;
-            var cacheToken = true;
             if (AccessToken is not null)
             {
                 var supplied = SuppliedAccessToken.Read(AccessToken);
-                cacheKey = supplied.CacheKey;
-                getToken = _ => ValueTask.FromResult(supplied.Token);
+                getToken = _ => ValueTask.FromResult(supplied);
                 tokenSource = "the supplied access token";
-                cacheToken = supplied.CacheToken;
             }
             else if (context is not null)
             {
                 profile = AzContextAuthentication.ConvertProfile(context);
-                cacheKey = AzContextAuthentication.GetCacheKey(profile);
+                AzContextAuthentication.ValidateProfile(profile);
                 getToken = GetContextToken;
                 tokenSource = "Az.Accounts for the supplied context";
             }
 
-            connect = Task.Run(() => ConnectAsync(cacheKey, getToken, tokenSource, cacheToken, Log, ct), ct);
+            connect = Task.Run(() => ConnectAsync(getToken, tokenSource, profile, credentialSource, Log, ct), ct);
             PumpMessages(connect, messages);
             try
             {
@@ -196,7 +196,7 @@ public sealed class NewJAzCloudShellSessionCommand : PSCmdlet
                 _ => ErrorCategory.ConnectionError,
             };
             var message = context is null && AccessToken is null && ex is (AuthenticationFailedException or CredentialUnavailableException)
-                ? $"DefaultAzureCredential could not obtain an Azure token. Sign in with Azure CLI (az login), Azure PowerShell (Connect-AzAccount), or another supported developer credential. {ex.Message}"
+                ? $"The default Azure credential search could not obtain an Azure token. Configure environment credentials, sign in with VS Code or Azure CLI, or supply -Context or -AccessToken. {ex.Message}"
                 : ex.Message;
             var error = new ErrorRecord(new CloudShellException("Connect", message, inner: ex), "AzCloudShellConnectFailed", category, context);
             if (context is null)
@@ -243,7 +243,6 @@ public sealed class NewJAzCloudShellSessionCommand : PSCmdlet
             _ when message.StartsWith("Acquiring an Azure Resource Manager token", StringComparison.Ordinal) => 5,
             _ when message.StartsWith("Reading Cloud Shell user settings", StringComparison.Ordinal) => 15,
             _ when message.StartsWith("Requesting a Cloud Shell console", StringComparison.Ordinal) => 25,
-            _ when message.StartsWith("Reusing the existing Cloud Shell console", StringComparison.Ordinal) => 30,
             _ when message.StartsWith("Creating a bash terminal", StringComparison.Ordinal) => 40,
             _ when message.StartsWith("Connecting to the Cloud Shell terminal WebSocket", StringComparison.Ordinal) => 50,
             _ when message.StartsWith("Waiting for the Cloud Shell bash prompt", StringComparison.Ordinal) => 60,
@@ -254,10 +253,10 @@ public sealed class NewJAzCloudShellSessionCommand : PSCmdlet
     }
 
     private async Task<CloudShellBridgeChannel> ConnectAsync(
-        string cacheKey,
         Func<CancellationToken, ValueTask<AccessToken>>? getSuppliedToken,
         string tokenSource,
-        bool cacheToken,
+        IAzureContextContainer? profile,
+        AzureCredentialSource? credentialSource,
         Action<string> log,
         CancellationToken ct)
     {
@@ -269,21 +268,53 @@ public sealed class NewJAzCloudShellSessionCommand : PSCmdlet
         using var http = HttpClientFactoryOverride?.Invoke()
             ?? new HttpClient(new SocketsHttpHandler { AllowAutoRedirect = false }) { Timeout = TimeSpan.FromSeconds(100) };
         ValueTask<AccessToken> GetToken(CancellationToken token) =>
-            DefaultAuthentication.GetTokenAsync(TenantId, NoWAM.IsPresent, log, token);
+            DefaultAuthentication.GetTokenAsync(
+                TenantId, credentialSource, new TokenRequestContext([CloudShellClient.ArmScope], tenantId: TenantId), log, token);
+        AccessToken? contextToken = null;
+        var useCompatibleCredential = false;
+        async ValueTask<AccessToken> GetSelectedToken(CancellationToken token)
+        {
+            if (getSuppliedToken is null)
+            {
+                return await GetToken(token).ConfigureAwait(false);
+            }
+
+            var selected = await getSuppliedToken(token).ConfigureAwait(false);
+            if (profile is null)
+            {
+                return selected;
+            }
+
+            contextToken = selected;
+            if (!useCompatibleCredential)
+            {
+                return selected;
+            }
+
+            return await AzContextAuthentication.GetCloudShellTokenAsync(profile, selected, log, token).ConfigureAwait(false);
+        }
 
         while (true)
         {
-            var (webSocketUri, reused) = await CloudShellConsoleCache.CreateTerminalAsync(
-                cacheKey, getSuppliedToken ?? GetToken, http, TerminalColumns, TerminalRows, log, ct, tokenSource, cacheToken).ConfigureAwait(false);
+            Uri webSocketUri;
             try
             {
-                return await OpenTerminalAsync(WebSocketUriOverride ?? webSocketUri, log, ct).ConfigureAwait(false);
+                log($"Acquiring an Azure Resource Manager token with {tokenSource}.");
+                var token = await GetSelectedToken(ct).ConfigureAwait(false);
+                var client = new CloudShellClient(http, token.Token, log);
+                var consoleUri = await client.ProvisionConsoleAsync(ct).ConfigureAwait(false);
+                webSocketUri = await client.CreateTerminalAsync(consoleUri, TerminalColumns, TerminalRows, ct).ConfigureAwait(false);
             }
-            catch (CloudShellException ex) when (reused && !ct.IsCancellationRequested)
+            catch (CloudShellException ex) when (profile is not null && contextToken.HasValue && !useCompatibleCredential &&
+                ex.StatusCode == System.Net.HttpStatusCode.BadRequest && ex.Message.Contains("ClientNotAllowed", StringComparison.Ordinal))
             {
-                log($"The reused Cloud Shell console did not respond ({ex.Message}); requesting it again.");
-                CloudShellConsoleCache.Invalidate(cacheKey);
+                log("Cloud Shell rejected the Azure PowerShell client; requesting a compatible token for the same account and tenant.");
+                useCompatibleCredential = true;
+                tokenSource = "an account-verified Cloud Shell credential";
+                continue;
             }
+
+            return await OpenTerminalAsync(WebSocketUriOverride ?? webSocketUri, log, ct).ConfigureAwait(false);
         }
     }
 

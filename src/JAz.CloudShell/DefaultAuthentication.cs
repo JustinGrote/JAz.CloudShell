@@ -4,52 +4,94 @@ using Azure.Identity.Broker;
 
 namespace JAz.CloudShell;
 
+public enum AzureCredentialSource
+{
+    Environment,
+    VSCode,
+    AzureCLI,
+    WAM,
+}
+
 internal static class DefaultAuthentication
 {
-    internal static ValueTask<AccessToken> GetTokenAsync(string? tenantId, bool noWam, Action<string> log, CancellationToken ct)
-    {
-        TokenCredential? broker = OperatingSystem.IsWindows() && !noWam
-            ? new InteractiveBrowserCredential(new InteractiveBrowserCredentialBrokerOptions(IntPtr.Zero)
-            {
-                // Azure CLI's public client is supported by both WAM and the Cloud Shell service.
-                ClientId = "04b07795-8ddb-461a-bbee-02f9e1bf7b46",
-                TenantId = tenantId,
-                UseDefaultBrokerAccount = true,
-                DisableAutomaticAuthentication = true,
-            })
-            : null;
-        return GetTokenAsync(broker, () => new DefaultAzureCredential(new DefaultAzureCredentialOptions
-        {
-            TenantId = tenantId,
-            ExcludeInteractiveBrowserCredential = true,
-        }), new TokenRequestContext([CloudShellClient.ArmScope], tenantId: tenantId), log, ct);
-    }
+    private const string BrokerClientId = "04b07795-8ddb-461a-bbee-02f9e1bf7b46";
+
+    internal static ValueTask<AccessToken> GetTokenAsync(
+        string? tenantId, AzureCredentialSource? source, TokenRequestContext request, Action<string> log, CancellationToken ct) =>
+        GetTokenAsync(CreateDefaultCredentials(tenantId, source), request, log, ct);
 
     internal static async ValueTask<AccessToken> GetTokenAsync(
-        TokenCredential? broker,
-        Func<TokenCredential> defaultCredential,
+        IEnumerable<(string Name, TokenCredential Credential)> credentials,
         TokenRequestContext request,
         Action<string> log,
         CancellationToken ct)
     {
-        ct.ThrowIfCancellationRequested();
-        if (broker is not null)
+        var credentialList = credentials.ToArray();
+        var unavailable = new List<string>();
+        CredentialUnavailableException? lastUnavailable = null;
+        for (var i = 0; i < credentialList.Length; i++)
         {
-            log("Checking Windows Web Account Manager (WAM) for a token without prompting.");
+            var (name, credential) = credentialList[i];
+            ct.ThrowIfCancellationRequested();
+            log($"Checking {name} for an Azure Resource Manager token.");
             try
             {
-                var token = await broker.GetTokenAsync(request, ct).ConfigureAwait(false);
-                log("Using a token from Windows Web Account Manager (WAM).");
+                var token = await credential.GetTokenAsync(request, ct).ConfigureAwait(false);
+                log($"Acquired an Azure Resource Manager token with {name}.");
                 return token;
             }
-            catch (Exception ex) when (!ct.IsCancellationRequested &&
-                ex is AuthenticationFailedException or CredentialUnavailableException)
+            catch (CredentialUnavailableException ex)
             {
-                log($"Silent WAM authentication was unavailable ({ex.GetType().Name}); trying DefaultAzureCredential.");
+                ct.ThrowIfCancellationRequested();
+                unavailable.Add(name);
+                lastUnavailable = ex;
+                log(i + 1 < credentialList.Length
+                    ? $"{name} is unavailable; trying the next credential."
+                    : $"{name} is unavailable.");
             }
         }
 
-        ct.ThrowIfCancellationRequested();
-        return await defaultCredential().GetTokenAsync(request, ct).ConfigureAwait(false);
+        throw new CredentialUnavailableException(
+            $"No Azure token was available from the configured credentials: {string.Join(", ", unavailable)}.",
+            lastUnavailable);
+    }
+
+    internal static (string Name, TokenCredential Credential)[] CreateDefaultCredentials(
+        string? tenantId, AzureCredentialSource? source = null)
+    {
+        List<(string Name, TokenCredential Credential)> credentials = [];
+
+        if (source is null or AzureCredentialSource.Environment)
+        {
+            credentials.Add(("EnvironmentCredential", new EnvironmentCredential()));
+        }
+
+        if (source is null or AzureCredentialSource.VSCode)
+        {
+            credentials.Add(("VisualStudioCodeCredential", new VisualStudioCodeCredential(new VisualStudioCodeCredentialOptions { TenantId = tenantId })));
+        }
+
+        if (source is null or AzureCredentialSource.AzureCLI)
+        {
+            credentials.Add(("AzureCliCredential", new AzureCliCredential(new AzureCliCredentialOptions { TenantId = tenantId })));
+        }
+
+        if (source == AzureCredentialSource.WAM || (source is null && OperatingSystem.IsWindows()))
+        {
+            if (!OperatingSystem.IsWindows())
+            {
+                throw new CredentialUnavailableException("The WAM credential source is only available on Windows.");
+            }
+
+            credentials.Add(("BrokerCredential", new InteractiveBrowserCredential(new InteractiveBrowserCredentialBrokerOptions(IntPtr.Zero)
+            {
+                ClientId = BrokerClientId,
+                TenantId = tenantId,
+                UseDefaultBrokerAccount = true,
+                DisableAutomaticAuthentication = true,
+            })));
+        }
+
+        return credentials.ToArray();
     }
 }

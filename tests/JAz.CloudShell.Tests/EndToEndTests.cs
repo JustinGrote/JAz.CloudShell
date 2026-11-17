@@ -314,7 +314,7 @@ public sealed class EndToEndTests : IDisposable
     [Fact]
     public void InvokeCommand_RunsInTheTerminalPowerShellProcess()
     {
-        Run("$global:s = New-JAzCloudShellSession -Name e2e -NoWAM -ConnectingTimeout 120");
+        Run("$global:s = New-JAzCloudShellSession -Name e2e -ConnectingTimeout 120");
 
         var pid = Run("Invoke-Command -Session $s { $PID }");
         Assert.Equal(_server.LastProcessId, (int)pid.Single().BaseObject);
@@ -363,17 +363,18 @@ public sealed class EndToEndTests : IDisposable
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
-    public void Contexts_SelectTokensAndIsolateConsolesForArraysAndPipeline(bool pipeline)
+    public void Contexts_SelectTokensAndProvisionEachSessionForArraysAndPipeline(bool pipeline)
     {
         SetUpContextAuthentication();
         Run(pipeline
             ? "$global:sessions = @($profiles[0], $profiles[1], $profiles[2], $profiles[0]) | New-JAzCloudShellSession"
             : "$global:sessions = New-JAzCloudShellSession -Context @($profiles[0], $profiles[1], $profiles[2], $profiles[0])");
 
-        Assert.Equal(["4", "3", "alice", "bob", "alice"], Run("$sessions.Count; $tokenRequests.Count; $tokenRequests.Account").Select(o => o.ToString()));
-        Assert.Equal(["tenant", "tenant", "other-tenant"], Run("$tokenRequests.Tenant").Select(o => o.ToString()));
+        Assert.Equal(["4", "4", "alice", "bob", "alice", "alice"], Run("$sessions.Count; $tokenRequests.Count; $tokenRequests.Account").Select(o => o.ToString()));
+        Assert.Equal(["tenant", "tenant", "other-tenant", "tenant"], Run("$tokenRequests.Tenant").Select(o => o.ToString()));
         Assert.Equal(4, (int)Run("@(Invoke-Command -Session $sessions { $PID } | Select-Object -Unique).Count").Single().BaseObject);
         Assert.Equal(["token-alice-tenant", "token-bob-tenant", "token-alice-other-tenant", "token-alice-tenant"], _terminalTokens);
+        Assert.Equal(Enumerable.Repeat(new[] { "GET", "PUT", "POST" }, 4).SelectMany(methods => methods), _requestMethods);
         Run("$sessions | Remove-PSSession");
         AssertEventually(() => _server.StoppedServers == 4 && _server.ClosedConnections == 4, "Context sessions did not close their terminals.");
     }
@@ -448,41 +449,39 @@ public sealed class EndToEndTests : IDisposable
         Assert.Single(Run("Get-Module Az.Accounts"));
         Assert.Equal(["provided-raw-token", "provided-raw-token"], _terminalTokens);
         Assert.Equal(2, _requestMethods.Count(m => m == "PUT"));
+        Assert.Equal(["GET", "PUT", "POST", "GET", "PUT", "POST"], _requestMethods);
         Assert.Equal(["2"], Run("@(Invoke-Command -Session $sessions { $PID } | Select-Object -Unique).Count").Select(o => o.ToString()));
         Run("$sessions | Remove-PSSession");
         AssertEventually(() => _server.StoppedServers == 2 && _server.ClosedConnections == 2, "Supplied-token sessions did not close.");
     }
 
     [Fact]
-    public void AccessToken_ReadsPSSecureAccessTokenAndReusesOnlyTheMatchingToken()
+    public void AccessToken_AcceptsSecureStringValuesFromAzTokenObjects()
     {
         SetUpSecureTokenObjects();
         Run("""
             $global:sessions = @(
-                New-JAzCloudShellSession -AccessToken $tokens[0]
-                New-JAzCloudShellSession -AccessToken $tokens[1]
-                New-JAzCloudShellSession -AccessToken $tokens[0]
+                New-JAzCloudShellSession -AccessToken $tokens[0].Token
+                New-JAzCloudShellSession -AccessToken $tokens[1].Token
+                New-JAzCloudShellSession -AccessToken $tokens[0].Token
             )
             """);
 
         Assert.Equal(["provided-first-token", "provided-second-token", "provided-first-token"], _terminalTokens);
-        Assert.Equal(2, _requestMethods.Count(m => m == "PUT"));
+        Assert.Equal(Enumerable.Repeat(new[] { "GET", "PUT", "POST" }, 3).SelectMany(methods => methods), _requestMethods);
         Assert.Equal(["3"], Run("@(Invoke-Command -Session $sessions { $PID } | Select-Object -Unique).Count").Select(o => o.ToString()));
         Run("$sessions | Remove-PSSession");
         AssertEventually(() => _server.StoppedServers == 3 && _server.ClosedConnections == 3, "Supplied-token sessions did not close.");
     }
 
     [Fact]
-    public void AccessToken_RejectsExpiredTokenWithoutCredentialFallback()
+    public void AccessToken_RejectsPSSecureAccessTokenObject()
     {
         SetUpSecureTokenObjects();
-        Run("$tokens[0].ExpiresOn = [DateTimeOffset]::UtcNow.AddMinutes(-1)");
         _ps.Commands.Clear();
         _ps.AddScript("New-JAzCloudShellSession -AccessToken $tokens[0]");
         Assert.Empty(_ps.Invoke());
-        var error = Assert.Single(_ps.Streams.Error);
-        Assert.Contains("expired", error.ToString());
-        Assert.DoesNotContain("DefaultAzureCredential", error.ToString());
+        Assert.Single(_ps.Streams.Error);
         Assert.Empty(_requestMethods);
     }
 
@@ -504,7 +503,7 @@ public sealed class EndToEndTests : IDisposable
     [Theory]
     [InlineData("-Context ([pscustomobject]@{})")]
     [InlineData("-TenantId 'tenant'")]
-    [InlineData("-NoWAM")]
+    [InlineData("-CredentialSource AzureCLI")]
     public void AccessToken_HasASeparateParameterSet(string otherParameter)
     {
         SetUpTokenAuthentication();
@@ -623,6 +622,5 @@ public sealed class EndToEndTests : IDisposable
         _server.Dispose();
         NewJAzCloudShellSessionCommand.WebSocketUriOverride = null;
         NewJAzCloudShellSessionCommand.HttpClientFactoryOverride = null;
-        CloudShellConsoleCache.Clear();
     }
 }

@@ -13,15 +13,22 @@ Remove-PSSession $cs
 
 ## How it works
 
-1. **Auth.** On Windows, the default authentication path first checks Web Account Manager (WAM) silently for a token
-   for the Windows default account, honoring `-TenantId` when supplied. It never opens a sign-in or account-selection
-   dialog. If WAM is unavailable or needs interaction, it falls back to `DefaultAzureCredential`'s noninteractive
-   chain: environment variables, workload identity, managed identity, Visual Studio, Azure CLI, Azure PowerShell,
-   and so on. Other operating systems use that chain directly. `-Verbose` reports WAM selection or fallback.
-   Use `-NoWAM` to skip the WAM check and go straight to DefaultAzureCredential. Its console cache is separate
-   from WAM-enabled sessions, so it cannot reuse a token previously obtained through WAM.
-   With `-Context`, the cmdlet instead uses `Get-AzAccessToken -DefaultProfile` from Az.Accounts for each supplied
-   `IAzureContextContainer`. It never switches the active Az context or falls back to another credential.
+1. **Auth.** 
+  Unfortunately, for some reason the Azure PowerShell module client ID is prevented from accessing the Azure Cloud Shell API,
+  so the most convenient credentials we would like to use are not available.
+
+  By default, the cmdlet checks `EnvironmentCredential`, then `VisualStudioCodeCredential`,
+   then `AzureCliCredential`, and finally the Windows broker on Windows.
+   The chain advances when a credential is unavailable; an authentication failure stops the chain.
+   `-Verbose` and the progress display report each credential attempt.
+   `-CredentialSource` limits authentication to one source: `Environment`, `VSCode`, `AzureCLI`, or `WAM`
+   (Windows only); it does not fall back to another source.
+   `-TenantId` is passed on the token request and to credentials that support a tenant option.
+   With `-Context`, the cmdlet starts with `Get-AzAccessToken -DefaultProfile` for each supplied
+   `IAzureContextContainer`. If Cloud Shell rejects the Azure PowerShell client, it silently requests a compatible
+   token for the selected account through WAM, or Azure CLI if WAM is unavailable. It checks the token's tenant and
+   account object IDs against the Az.Accounts token before contacting Cloud Shell with it. It never switches the
+   active Az context or silently connects as another account.
    With `-AccessToken`, it uses the supplied secure ARM access token directly without acquiring another credential.
 2. **Provisioning.** The flow is the one Devolutions Terminal uses, and it matches Windows Terminal:
    1. `GET userSettings/cloudconsole`
@@ -52,10 +59,10 @@ Remove-PSSession $cs
 | Parameter | Description |
 | --- | --- |
 | `-Name` | PSSession name. |
-| `-TenantId` | Tenant for `DefaultAzureCredential`. |
-| `-NoWAM` | Skip the silent Windows WAM check. Available only with default authentication, not `-Context` or `-AccessToken`. |
+| `-TenantId` | Optional tenant on the default credential's token request. |
+| `-CredentialSource` | Search only `Environment`, `VSCode`, `AzureCLI`, or `WAM` (Windows only). Cannot be combined with `-Context` or `-AccessToken`. |
 | `-Context` | One or more Az.Accounts `IAzureContextContainer` profiles. Accepts pipeline input and the same profile conversions as `Get-AzAccessToken -DefaultProfile`. Cannot be combined with `-TenantId`. |
-| `-AccessToken` | An Az.Accounts `PSSecureAccessToken` object or a `SecureString` containing an ARM access token. Uses a separate parameter set; cannot be combined with `-Context` or `-TenantId`. |
+| `-AccessToken` | A `SecureString` containing an ARM access token. Uses a separate parameter set; cannot be combined with `-Context` or `-TenantId`. |
 | `-ConnectingTimeout` | Seconds for the whole connect sequence (default 300, range 1–3600). |
 
 ### Az.Accounts profiles
@@ -73,23 +80,24 @@ Each profile produces one session using its default context's account and tenant
 and processing continues with the remaining profiles, unless `-ErrorAction Stop` is specified. The connection timeout
 applies separately to each profile.
 
-Cloud Shell can reject Azure PowerShell-issued tokens with `ClientNotAllowed`. This service restriction is reported
-unchanged; supplying a profile does not bypass it or silently substitute an Azure CLI identity. Omit `-Context` to use
-the existing DefaultAzureCredential flow instead.
+Cloud Shell can reject Azure PowerShell-issued tokens with `ClientNotAllowed`. The cmdlet then uses a compatible
+client for the same identity: on Windows it checks WAM using the context's home account ID, without showing a dialog.
+If WAM cannot supply a token (or the context has no home account ID), it tries Azure CLI for the context's tenant.
+The resulting token must have exactly the same tenant ID and account object ID as the Az.Accounts token. If neither
+credential can authenticate that identity, sign in to WAM or run `az login --tenant <tenant-id>` as the selected user,
+then retry. A mismatched account fails explicitly. This compatibility path requires a user context; service principal
+and managed identity contexts are not substituted with user credentials.
 
 ### Supplied access tokens
 
 ```powershell
 $token = Get-AzAccessToken -ResourceTypeName Arm
-$cs = New-JAzCloudShellSession -AccessToken $token
-
-# Alternatively, supply its SecureString directly:
 $cs = New-JAzCloudShellSession -AccessToken $token.Token
 ```
 
-The object form reads the secure string from `Token` and honors `ExpiresOn`; expired tokens are rejected locally.
-Provide the full token object for expiry-aware console reuse. A bare `SecureString` has no expiry metadata.
-Tokens are never automatically refreshed or replaced with another credential. Plaintext strings are not accepted.
+Only a `SecureString` is accepted; a `PSSecureAccessToken` object must be passed through its `Token` property.
+Secure strings have no expiry metadata, so expired tokens are rejected by Cloud Shell. Tokens are never automatically
+refreshed or replaced with another credential. Plaintext strings are not accepted.
 The token must be valid for public Azure Resource Manager
 and come from a client permitted by Cloud Shell; `-AccessToken` does not bypass the service's client restrictions.
 
@@ -99,16 +107,13 @@ and come from a client permitted by Cloud Shell; `-AccessToken` does not bypass 
   process and the Cloud Shell profile isn't loaded. Closing the session ends the server and returns the terminal to
   its prompt. If the WebSocket drops, the session becomes Broken. It does not reconnect, and
   commands are never replayed.
-- Each session uses its own Cloud Shell terminal. Within one PowerShell process, later context-based sessions for the same account and tenant
-  reuse the Cloud Shell console and access token (while the token has at least 5 minutes left) and only create a new
-  terminal. If the cached console is gone, the cmdlet provisions a fresh one automatically. Cloud Shell's own idle
-  timeout (about 20 minutes) still applies.
-  DefaultAzureCredential sessions retain their separate, per-tenant console cache.
-- console reuse for a second session, `Remove-PSSession`, and the `Disconnect-PSSession` error stops the remote `pwsh -s` and closes the WebSocket. `Disconnect-PSSession` isn't supported:
+- Each session acquires its credential, requests the Cloud Shell console, and makes a new terminal-creation call.
+  The module does not cache consoles or access tokens between sessions. Azure may return the same running console,
+  but each session uses its own terminal. Cloud Shell's own idle timeout (about 20 minutes) still applies.
+- `Remove-PSSession` stops the remote `pwsh -s` and closes the WebSocket. `Disconnect-PSSession` isn't supported:
   PowerShell only allows disconnect for WSMan sessions, so it reports an error and the session stays open and usable.
 - Sovereign clouds aren't supported.
-- Starting a session takes a few seconds with a warm Cloud Shell (about 7 s for the first session and 2 s for a
-  session that reuses the console). A cold Cloud Shell container takes longer. The cmdlet waits for the bash prompt
+- Starting a session takes a few seconds with a warm Cloud Shell. A cold Cloud Shell container takes longer. The cmdlet waits for the bash prompt
   before it types anything, and it answers the terminal's cursor-position queries (`ESC[6n`) the way a terminal
   emulator would.
 
@@ -119,7 +124,7 @@ client. These all worked:
 - `$PID` (the `pwsh -s` process) and `$using:` with Unicode text
 - 20,000 lines of output (about 4 s) and a 300 KB argument (under 1 s)
 - remote errors, native commands, and the Cloud Shell Az context
-- console reuse for a second session, `Remove-PSSession`, and the `Disconnect-PSSession` error
+- separate terminals for multiple sessions, `Remove-PSSession`, and the `Disconnect-PSSession` error
 
 The automated end-to-end test emulates the terminal and the launcher, and runs PSRP against a real `pwsh -s` on
 Windows. The real `bash`/`stty` launcher is only exercised in Cloud Shell. Linux and macOS clients haven't been tested.

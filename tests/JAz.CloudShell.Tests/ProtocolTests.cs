@@ -61,76 +61,16 @@ public class ProtocolTests
     }
 
     [Fact]
-    public async Task ConsoleCache_ReusesConsoleAndTokenAndRecoversWhenConsoleIsGone()
-    {
-        CloudShellConsoleCache.Clear();
-        var requests = new List<string>();
-        var tokens = 0;
-        var failNextTerminal = false;
-        using var http = new HttpClient(new StubHandler(request =>
-        {
-            requests.Add(request.Method.Method);
-            if (request.Method == HttpMethod.Post && failNextTerminal)
-            {
-                failNextTerminal = false;
-                return new HttpResponseMessage(System.Net.HttpStatusCode.NotFound);
-            }
-
-            return new HttpResponseMessage(System.Net.HttpStatusCode.OK)
-            {
-                Content = new StringContent(request.Method.Method switch
-                {
-                    "PUT" => """{"properties":{"uri":"https://ux.console.azure.com/c/cc-1"}}""",
-                    "POST" => """{"id":"t1"}""",
-                    _ => "{}",
-                }),
-            };
-        }));
-        ValueTask<Azure.Core.AccessToken> GetToken(CancellationToken ct)
-        {
-            tokens++;
-            return ValueTask.FromResult(new Azure.Core.AccessToken("token", DateTimeOffset.UtcNow.AddHours(1)));
-        }
-
-        Task<(Uri WebSocketUri, bool Reused)> Create() => CloudShellConsoleCache.CreateTerminalAsync("tenant", GetToken, http, 80, 24, _ => { }, CancellationToken.None);
-        try
-        {
-            var first = await Create();
-            Assert.Equal(("wss://ux.console.azure.com/c/cc-1/terminals/t1", false), (first.WebSocketUri.AbsoluteUri, first.Reused));
-            Assert.Equal(["GET", "PUT", "POST"], requests);
-
-            requests.Clear();
-            Assert.True((await Create()).Reused);
-            Assert.Equal(["POST"], requests);
-
-            requests.Clear();
-            failNextTerminal = true;
-            Assert.False((await Create()).Reused);
-            Assert.Equal(["POST", "GET", "PUT", "POST"], requests);
-            Assert.Equal(2, tokens);
-        }
-        finally
-        {
-            CloudShellConsoleCache.Clear();
-        }
-    }
-
-    private sealed class StubHandler(Func<HttpRequestMessage, HttpResponseMessage> respond) : HttpMessageHandler
-    {
-        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken) =>
-            Task.FromResult(respond(request));
-    }
-
-    [Fact]
     public void ConnectionProgress_AdvancesByPhaseAndNeverMovesBackwards()
     {
         var percent = -1;
         var seen = new List<int>();
         foreach (var message in new[]
         {
-            "Reusing the existing Cloud Shell console.",
-            "Could not reuse the Cloud Shell console (gone); requesting it again.",
-            "Acquiring an Azure Resource Manager token with DefaultAzureCredential.",
+            "Acquiring an Azure Resource Manager token with the default Azure credential chain.",
+            "Reading Cloud Shell user settings.",
+            "Cloud Shell rejected the Azure PowerShell client; requesting a compatible token for the same account and tenant.",
+            "Acquiring an Azure Resource Manager token with an account-verified Cloud Shell credential.",
             "Reading Cloud Shell user settings.",
             "Requesting a Cloud Shell console.",
             "Creating a bash terminal.",
@@ -143,6 +83,6 @@ public class ProtocolTests
             seen.Add(percent);
         }
 
-        Assert.Equal([30, 30, 30, 30, 30, 40, 50, 60, 75], seen);
+        Assert.Equal([5, 15, 15, 15, 15, 25, 40, 50, 60, 75], seen);
     }
 }

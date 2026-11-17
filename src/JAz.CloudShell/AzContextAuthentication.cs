@@ -12,19 +12,17 @@ internal static class AzContextAuthentication
     internal static IAzureContextContainer ConvertProfile(PSObject context) =>
         LanguagePrimitives.ConvertTo<IAzureContextContainer>(context.BaseObject);
 
-    internal static string GetCacheKey(IAzureContextContainer profile)
+    internal static void ValidateProfile(IAzureContextContainer profile)
     {
         var context = profile.DefaultContext
             ?? throw new ArgumentException("The supplied IAzureContextContainer has no default context.", nameof(profile));
-        var account = RequireValue(context.Account?.Id, "account ID");
-        var tenant = RequireValue(context.Tenant?.Id, "tenant ID");
+        RequireValue(context.Account?.Id, "account ID");
+        RequireValue(context.Tenant?.Id, "tenant ID");
         var environment = RequireValue(context.Environment?.Name, "environment name");
         if (!string.Equals(environment, "AzureCloud", StringComparison.OrdinalIgnoreCase))
         {
             throw new ArgumentException("Only public Azure (AzureCloud) contexts are supported.", nameof(context));
         }
-
-        return $"context:{account.Length}:{account}:{tenant}";
     }
 
     private static string RequireValue(string? value, string property)
@@ -35,6 +33,27 @@ internal static class AzContextAuthentication
         }
 
         throw new ArgumentException($"Context must contain a nonempty {property}.", "Context");
+    }
+
+    internal static ValueTask<AccessToken> GetCloudShellTokenAsync(
+        IAzureContextContainer profile, AccessToken contextToken, Action<string> log, CancellationToken ct)
+    {
+        var context = profile.DefaultContext;
+        var tenant = RequireValue(context.Tenant?.Id, "tenant ID");
+        var account = context.Account;
+        if (account is null || !string.Equals(account.Type, "User", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new AuthenticationFailedException("Cloud Shell-compatible context authentication requires a signed-in user account.");
+        }
+
+        AuthenticationRecord? record = null;
+        if (account.ExtendedProperties is not null &&
+            account.ExtendedProperties.TryGetValue("HomeAccountId", out var homeAccountId) && !string.IsNullOrWhiteSpace(homeAccountId))
+        {
+            record = ContextTokenCredential.CreateRecord(RequireValue(account.Id, "account ID"), homeAccountId, tenant);
+        }
+
+        return ContextTokenCredential.GetTokenAsync(contextToken, tenant, record, log, ct);
     }
 
     internal static AccessToken GetToken(IAzureContextContainer context, CancellationToken ct)
