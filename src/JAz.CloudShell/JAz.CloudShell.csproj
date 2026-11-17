@@ -13,9 +13,9 @@
 
   <ItemGroup>
     <!-- Compile against the PowerShell 7.6 API baseline; PowerShell itself provides SMA at runtime. -->
-    <PackageReference Include="System.Management.Automation" Version="7.6.0" PrivateAssets="all" ExcludeAssets="runtime" />
-    <PackageReference Include="Azure.Identity" Version="1.21.0" />
-    <PackageReference Include="Azure.Identity.Broker" Version="1.7.0" />
+    <PackageReference Include="System.Management.Automation" PrivateAssets="all" ExcludeAssets="runtime" />
+    <PackageReference Include="Azure.Identity" />
+    <PackageReference Include="Azure.Identity.Broker" />
   </ItemGroup>
 
   <ItemGroup>

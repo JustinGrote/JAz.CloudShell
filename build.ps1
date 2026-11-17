@@ -1,7 +1,7 @@
 #requires -Version 7.6
 <#
 .SYNOPSIS
-Builds, tests, and stages the JAz.CloudShell module into out\JAz.CloudShell.
+Builds, tests, and stages the JAz.CloudShell module into Artifacts\publish\JAz.CloudShell\<configuration>.
 #>
 param(
     [ValidateSet('Debug', 'Release')]
@@ -11,7 +11,8 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
-$out = Join-Path $PSScriptRoot 'out' 'JAz.CloudShell'
+$artifacts = Join-Path $PSScriptRoot 'Artifacts'
+$out = Join-Path $artifacts 'publish' 'JAz.CloudShell' $Configuration.ToLowerInvariant()
 if (Test-Path $out) { Remove-Item $out -Recurse -Force }
 
 dotnet publish (Join-Path $PSScriptRoot 'src' 'JAz.CloudShell') -c $Configuration -o $out --nologo
@@ -24,7 +25,8 @@ Copy-Item (Join-Path $PSScriptRoot 'README.md'), (Join-Path $PSScriptRoot 'THIRD
 if (-not $SkipTests) {
     Push-Location $PSScriptRoot
     try {
-        dotnet test --project (Join-Path 'tests' 'JAz.CloudShell.Tests') -c $Configuration
+        $results = Join-Path $artifacts 'TestResults' $Configuration.ToLowerInvariant()
+        dotnet test --project (Join-Path 'tests' 'JAz.CloudShell.Tests') -c $Configuration --results-directory $results
         if ($LASTEXITCODE) { throw "Tests failed ($LASTEXITCODE)." }
     } finally {
         Pop-Location

@@ -4,7 +4,7 @@ A custom PowerShell remoting transport for **Azure Cloud Shell**. `New-JAzCloudS
 `PSSession`, so you can use the usual remoting commands with it:
 
 ```powershell
-Import-Module ./out/JAz.CloudShell
+Import-Module .\Artifacts\publish\JAz.CloudShell\release\JAz.CloudShell.psd1
 $cs = New-JAzCloudShellSession -Verbose
 Invoke-Command -Session $cs { $PID; $PSVersionTable.PSVersion; Get-AzContext }
 Enter-PSSession $cs
@@ -125,9 +125,14 @@ Windows. The real `bash`/`stty` launcher is only exercised in Cloud Shell. Linux
 ## Build and test
 
 ```powershell
-./build.ps1             # publish to out/JAz.CloudShell and run all tests
+./build.ps1             # publish to Artifacts\publish\JAz.CloudShell\release and run all tests
 ./build.ps1 -SkipTests
 ```
+
+Build and intermediate outputs use .NET's centralized artifacts layout under `Artifacts\bin` and `Artifacts\obj`.
+NuGet package versions are managed centrally in `Directory.Packages.props`.
+Published modules go to `Artifacts\publish\JAz.CloudShell\<configuration>`, and the build script writes test results
+to `Artifacts\TestResults\<configuration>`. Debug and Release outputs are kept separate.
 
 The tests need `pwsh` on `PATH`. Profile integration tests also need Az.Accounts installed and are skipped if it is
 unavailable; they mock token acquisition and HTTP requests and never sign in or contact Azure.
