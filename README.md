@@ -20,23 +20,23 @@ Remove-PSSession $cs
    2. `PUT consoles/default` with `osType: linux`
    3. `POST {cloudShellUri}/terminals?shell=pwsh`
    4. Connect to the terminal WebSocket (handles both direct and Azure Relay endpoints).
-3. **Discovery.** The cmdlet types a probe at the interactive Cloud Shell prompt to read `$PID`, the PowerShell version,
-   and the .NET version.
-4. **Bridge.** A small helper script is uploaded in chunks. Each chunk is acknowledged, and the whole upload is checked
-   by length and SHA-256. The helper is then started as a child `pwsh`. It:
-   - switches the TTY to raw mode with no echo
-   - connects to the PowerShell remoting named pipe of the `$PID` process
-     (`PSHost.<start>.<pid>.<appdomain>.pwsh`, the same endpoint `Enter-PSHostProcess` uses)
-   - relays bytes as nonce-tagged base64 frames over the terminal
-5. **Transport.** A `RunspaceConnectionInfo` / `ClientSessionTransportManagerBase` pair carries PSRP over that framed
-   channel, following the pattern in [PaulHigin/NamedPipeConnection](https://github.com/PaulHigin/NamedPipeConnection).
+3. **Server mode.** Once PSReadLine is reading input, the cmdlet types one line at the interactive Cloud Shell prompt.
+   That line runs a short `bash -c` launcher that:
+   - switches the TTY to raw mode with no echo, so PSRP passes through unchanged
+   - starts `pwsh -NoLogo -NoProfile -s` (PowerShell's built-in remoting server mode), with stdin and stdout/stderr
+     connected through pipes so .NET never treats them as a terminal
+   - discards terminal input until a nonce-tagged start line, so stray terminal replies can't reach the server
+   - ends the server's stdin on a nonce-tagged stop line, then restores the TTY and prints an exit marker
+4. **Transport.** A `RunspaceConnectionInfo` / `ClientSessionTransportManagerBase` pair, following the pattern in
+   [PaulHigin/NamedPipeConnection](https://github.com/PaulHigin/NamedPipeConnection), writes PSRP lines to the
+   server's stdin and reads PSRP lines from its stdout. Other server output (stderr is merged into the same stream) is
+   kept and included in the error if the server exits.
 
 ## Requirements
 
 - PowerShell 7.6 or later (.NET 10) locally, on Windows, Linux, or macOS.
 - A Cloud Shell account that is already onboarded in the public Azure cloud. Open https://shell.azure.com once to set it
   up. The module never onboards an account or changes your Cloud Shell settings.
-- PowerShell 7.6 or later on .NET 10 in Cloud Shell. The cmdlet checks this and fails clearly if it isn't met.
 
 ## Parameters
 
@@ -48,8 +48,9 @@ Remove-PSSession $cs
 
 ## Limitations
 
-- The session is attached to one interactive Cloud Shell terminal. Closing the session ends the bridge helper and
-  returns the terminal to its prompt. If the WebSocket drops, the session becomes Broken. It does not reconnect, and
+- The session runs in a separate `pwsh -s` process started from one Cloud Shell terminal, so `$PID` is that
+  process and the Cloud Shell profile isn't loaded. Closing the session ends the server and returns the terminal to
+  its prompt. If the WebSocket drops, the session becomes Broken. It does not reconnect, and
   commands are never replayed.
 - Each session uses one Cloud Shell terminal. Cloud Shell's own idle timeout (about 20 minutes) still applies.
 - Sovereign clouds aren't supported.
@@ -59,15 +60,15 @@ Remove-PSSession $cs
 
 ## Validation
 
-The module was tested live against public Azure Cloud Shell (PowerShell 7.6.9 on .NET 10.0.14, Linux), with Windows
-as the local client. These all worked:
-- `$PID` and `$using:` with Unicode text
-- 20,000 lines of output and a 300 KB argument
-- remote errors, native commands, and the existing Az context
+The module was tested live against public Azure Cloud Shell (PowerShell 7.6.9, Linux), with Windows as the local
+client. These all worked:
+- `$PID` (the `pwsh -s` process) and `$using:` with Unicode text
+- 20,000 lines of output (about 4 s) and a 300 KB argument (under 1 s)
+- remote errors, native commands, and the Cloud Shell Az context
 - `Remove-PSSession`
 
-The automated end-to-end test drives the real helper, named pipe, and PSRP through a local fake terminal backed by
-`pwsh` on Windows. Linux and macOS clients haven't been tested.
+The automated end-to-end test emulates the terminal and the launcher, and runs PSRP against a real `pwsh -s` on
+Windows. The real `bash`/`stty` launcher is only exercised in Cloud Shell. Linux and macOS clients haven't been tested.
 
 ## Build and test
 
@@ -77,4 +78,4 @@ The automated end-to-end test drives the real helper, named pipe, and PSRP throu
 ```
 
 The tests need `pwsh` on `PATH`. The end-to-end test starts a loopback WebSocket "terminal" backed by a real `pwsh`
-process and runs `New-AzCloudShellSession` and `Invoke-Command` against it.
+server-mode process and runs `New-AzCloudShellSession` and `Invoke-Command` against it.

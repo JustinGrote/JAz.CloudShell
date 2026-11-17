@@ -12,7 +12,7 @@ namespace JAz.CloudShell.Tests;
 
 /// <summary>
 /// A local stand-in for the Cloud Shell terminal WebSocket: each connection is backed by a real pwsh process whose
-/// stdin/stdout are relayed over the socket. This exercises the real bootstrap, remote helper, named pipe, and PSRP.
+/// stdin/stdout are relayed over the socket. This exercises the real bootstrap, server-mode pwsh, and PSRP.
 /// </summary>
 internal sealed class FakeTerminalServer : IDisposable
 {
@@ -78,65 +78,39 @@ internal sealed class FakeTerminalServer : IDisposable
         }
     }
 
+    /// <summary>
+    /// Emulates the Cloud Shell terminal: an interactive pwsh prompt that echoes input until the launch line arrives,
+    /// then the bash launcher (raw TTY, discard input until the start line, forward lines to <c>pwsh -s</c> until the
+    /// stop line, print the exit marker). The server-mode pwsh is real.
+    /// </summary>
     private async Task ServeAsync(WebSocket ws)
     {
-        var psi = new ProcessStartInfo("pwsh", "-NoLogo -NoProfile -NonInteractive -Command -")
-        {
-            RedirectStandardInput = true,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-        };
-        using var process = Process.Start(psi)!;
-        lock (_processes)
-        {
-            _processes.Add(process);
-        }
-
-        LastProcessId = process.Id;
-        process.ErrorDataReceived += (_, e) =>
-        {
-            lock (_stderr)
-            {
-                _stderr.AppendLine(e.Data);
-            }
-        };
-        process.BeginErrorReadLine();
-
         var sendLock = new SemaphoreSlim(1, 1);
-        var output = Task.Run(async () =>
+        async Task SendAsync(byte[] bytes)
         {
-            var buffer = new byte[8192];
-            int read;
-            while ((read = await process.StandardOutput.BaseStream.ReadAsync(buffer)) > 0)
-            {
-                await sendLock.WaitAsync();
-                try
-                {
-                    await ws.SendAsync(buffer.AsMemory(0, read), WebSocketMessageType.Binary, true, CancellationToken.None);
-                }
-                finally
-                {
-                    sendLock.Release();
-                }
-            }
-        });
-
-        try
-        {
-            // Look like PSReadLine at an idle prompt, which queries the cursor position before reading input.
             await sendLock.WaitAsync();
             try
             {
-                await ws.SendAsync("PS /home/test> \e[6n"u8.ToArray(), WebSocketMessageType.Binary, true, CancellationToken.None);
+                await ws.SendAsync(bytes, WebSocketMessageType.Binary, true, CancellationToken.None);
             }
             finally
             {
                 sendLock.Release();
             }
+        }
+
+        Process? process = null;
+        Task? relay = null;
+        try
+        {
+            // Look like PSReadLine at an idle prompt, which queries the cursor position before reading input.
+            await SendAsync("PS /home/test> \e[6n"u8.ToArray());
 
             var buffer = new byte[16384];
-            var stdin = process.StandardInput.BaseStream;
+            var pending = new StringBuilder();
+            string? nonce = null;
+            var forwarding = false;
+            var stopped = false;
             while (ws.State == WebSocketState.Open)
             {
                 var result = await ws.ReceiveAsync(buffer, _cts.Token);
@@ -145,11 +119,112 @@ internal sealed class FakeTerminalServer : IDisposable
                     break;
                 }
 
-                // PSReadLine consumes cursor position reports; the redirected pwsh would try to execute them.
-                var text = Encoding.UTF8.GetString(buffer, 0, result.Count).Replace("\e[1;1R", string.Empty, StringComparison.Ordinal);
+                var text = Encoding.UTF8.GetString(buffer, 0, result.Count);
+                if (nonce is null)
+                {
+                    // Interactive prompt: PSReadLine consumes cursor reports and echoes typed text.
+                    text = text.Replace("\e[1;1R", string.Empty, StringComparison.Ordinal);
+                    await SendAsync(Encoding.UTF8.GetBytes(text));
+                    pending.Append(text);
+                    var line = pending.ToString();
+                    var enter = line.IndexOf('\r');
+                    if (enter < 0)
+                    {
+                        continue;
+                    }
 
-                // Emulate a cooked-mode PTY (icrnl): Enter (CR) reaches the shell as LF.
-                await stdin.WriteAsync(Encoding.UTF8.GetBytes(text.Replace('\r', '\n')));
+                    var match = System.Text.RegularExpressions.Regex.Match(line[..enter], @"printf ""~JZ%s%s~\\n"" R ([0-9A-F]+);");
+                    Assert.True(match.Success, $"Unexpected command: {line}");
+                    nonce = match.Groups[1].Value;
+                    pending.Clear();
+                    pending.Append(line[(enter + 1)..].Replace('\r', '\n'));
+
+                    var psi = new ProcessStartInfo("pwsh", "-NoLogo -NoProfile -s")
+                    {
+                        RedirectStandardInput = true,
+                        RedirectStandardOutput = true,
+                        RedirectStandardError = true,
+                        UseShellExecute = false,
+                    };
+                    process = Process.Start(psi)!;
+                    lock (_processes)
+                    {
+                        _processes.Add(process);
+                    }
+
+                    LastProcessId = process.Id;
+                    var proc = process;
+                    var exitMarker = Encoding.UTF8.GetBytes($"~JZC{nonce}~\n");
+                    relay = Task.Run(async () =>
+                    {
+                        // stdout and stderr share the terminal (2>&1 | cat).
+                        var stderr = Task.Run(async () =>
+                        {
+                            string? l;
+                            while ((l = await proc.StandardError.ReadLineAsync()) is not null)
+                            {
+                                lock (_stderr)
+                                {
+                                    _stderr.AppendLine(l);
+                                }
+
+                                await SendAsync(Encoding.UTF8.GetBytes(l + "\n"));
+                            }
+                        });
+                        var outBuffer = new byte[8192];
+                        int read;
+                        while ((read = await proc.StandardOutput.BaseStream.ReadAsync(outBuffer)) > 0)
+                        {
+                            await SendAsync(outBuffer[..read]);
+                        }
+
+                        await stderr;
+                        await SendAsync(exitMarker);
+                    });
+
+                    // A cursor query arriving just before raw mode, whose report the input filter must discard.
+                    await SendAsync(Encoding.UTF8.GetBytes($"\e[6n~JZR{nonce}~\n"));
+                    text = string.Empty;
+                }
+                else
+                {
+                    pending.Append(text);
+                }
+
+                // Raw mode: lines are LF-terminated and not echoed.
+                var all = pending.ToString();
+                var last = all.LastIndexOf('\n');
+                if (last < 0)
+                {
+                    continue;
+                }
+
+                pending.Clear();
+                pending.Append(all[(last + 1)..]);
+                var stdin = process!.StandardInput;
+                foreach (var l in all[..last].Split('\n'))
+                {
+                    if (!forwarding)
+                    {
+                        forwarding = l.Contains($"JZSTART{nonce}", StringComparison.Ordinal);
+                        continue;
+                    }
+
+                    if (l == $"JZSTOP{nonce}")
+                    {
+                        stdin.Close();
+                        stopped = true;
+                        break;
+                    }
+
+                    await stdin.WriteAsync(l + "\n");
+                }
+
+                if (stopped)
+                {
+                    break;
+                }
+
                 await stdin.FlushAsync();
             }
         }
@@ -158,9 +233,14 @@ internal sealed class FakeTerminalServer : IDisposable
         }
         finally
         {
+            if (relay is not null)
+            {
+                await Task.WhenAny(relay, Task.Delay(5000));
+            }
+
             try
             {
-                process.Kill(entireProcessTree: true);
+                process?.Kill(entireProcessTree: true);
             }
             catch
             {
@@ -168,10 +248,7 @@ internal sealed class FakeTerminalServer : IDisposable
 
             ws.Dispose();
         }
-
-        await Task.WhenAny(output, Task.Delay(2000));
     }
-
     public void Dispose()
     {
         _cts.Cancel();

@@ -10,20 +10,9 @@ namespace JAz.CloudShell;
 /// <summary>Connection information for a PowerShell runspace bridged over an Azure Cloud Shell terminal.</summary>
 public sealed class AzCloudShellConnectionInfo : RunspaceConnectionInfo
 {
-    internal AzCloudShellConnectionInfo(CloudShellBridgeChannel channel, int processId, Version remotePSVersion)
-    {
-        Channel = channel;
-        ProcessId = processId;
-        RemotePSVersion = remotePSVersion;
-    }
+    internal AzCloudShellConnectionInfo(CloudShellBridgeChannel channel) => Channel = channel;
 
     internal CloudShellBridgeChannel Channel { get; }
-
-    /// <summary>The Cloud Shell PowerShell process ($PID) this session is attached to.</summary>
-    public int ProcessId { get; }
-
-    /// <summary>PowerShell version of the Cloud Shell process.</summary>
-    public Version RemotePSVersion { get; }
 
     public override string ComputerName
     {
@@ -51,7 +40,7 @@ public sealed class AzCloudShellConnectionInfo : RunspaceConnectionInfo
 
     // PowerShell clones connection info when it creates the runspace. The clone intentionally refers to the same
     // single-use bridge; the channel itself rejects a second transport binding.
-    public override RunspaceConnectionInfo Clone() => new AzCloudShellConnectionInfo(Channel, ProcessId, RemotePSVersion);
+    public override RunspaceConnectionInfo Clone() => new AzCloudShellConnectionInfo(Channel);
 
     public override BaseClientSessionTransportManager CreateClientSessionTransportManager(Guid instanceId, string sessionName, PSRemotingCryptoHelper cryptoHelper) =>
         new AzCloudShellClientSessionTransportManager(this, instanceId, cryptoHelper);

@@ -15,7 +15,7 @@ https://github.com/microsoft/terminal — Copyright (c) Microsoft Corporation.
 
 https://github.com/PaulHigin/NamedPipeConnection — Copyright (c) Paul Higinbotham.
 
-## PowerShell (named pipe naming, remoting transport APIs)
+## PowerShell (server mode, remoting transport APIs)
 
 https://github.com/PowerShell/PowerShell — Copyright (c) Microsoft Corporation.
 

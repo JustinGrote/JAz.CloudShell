@@ -34,27 +34,6 @@ public class ProtocolTests
         Assert.Throws<CloudShellException>(() => CloudShellClient.ValidateServiceUri(value, Uri.UriSchemeHttps, "Test"));
 
     [Fact]
-    public void FrameParser_HandlesSplitCoalescedAndForeignText()
-    {
-        var parser = new FrameParser("N1");
-        var a = FrameParser.Encode("N1", 'D', "hello"u8);
-        var b = FrameParser.Encode("N1", 'C', ReadOnlySpan<byte>.Empty);
-        var echo = FrameParser.Encode("N1", 'd', "echo"u8);
-        var other = FrameParser.Encode("N2", 'D', "other"u8);
-        var stream = "PS> noise\r\n" + other + a + echo + b;
-
-        var frames = new List<(char Kind, byte[] Payload)>();
-        foreach (var piece in stream.Chunk(3))
-        {
-            frames.AddRange(parser.Feed(new string(piece)));
-        }
-
-        Assert.Equal(['D', 'd', 'C'], frames.Select(f => f.Kind));
-        Assert.Equal("hello", Encoding.UTF8.GetString(frames[0].Payload));
-        Assert.Empty(frames[2].Payload);
-    }
-
-    [Fact]
     public void CountCursorQueries_DetectsQueriesSplitAcrossMessages()
     {
         var tail = string.Empty;
@@ -65,32 +44,19 @@ public class ProtocolTests
     }
 
     [Fact]
-    public void FrameParser_RejectsCorruptPayload() =>
-        Assert.Throws<InvalidDataException>(() => new FrameParser("N").Feed("~JZN|D|not base64!~").ToList());
-
-    [Fact]
-    public void ProbeParsing_AcceptsPrereleaseVersions()
+    public void BuildLaunchCommand_StartsServerModeWithoutEchoingMarkers()
     {
-        var match = new Regex(@"~JZPab\|(\d+)\|([0-9][^|~\s]*)\|([0-9][^|~\s]*)~").Match("~JZPab|4242|7.6.1-preview.2|10.0.3~");
-        var result = Bootstrapper.ParseProbe(match, "ab");
-        Assert.Equal(4242, result.ProcessId);
-        Assert.Equal(new Version(7, 6, 1), result.PSVersion);
-        Bootstrapper.ValidateRemoteVersion(result);
-    }
+        var command = Bootstrapper.BuildLaunchCommand("CAFE");
+        var script = Regex.Match(command, "bash -c '([^']*)';").Groups[1].Value;
 
-    [Theory]
-    [InlineData("7.5.4", "10.0.0")]
-    [InlineData("7.6.0", "9.0.10")]
-    public void ValidateRemoteVersion_RejectsOldRuntimes(string ps, string net) =>
-        Assert.Throws<CloudShellException>(() => Bootstrapper.ValidateRemoteVersion(new BootstrapResult(1, Version.Parse(ps), Version.Parse(net), "n")));
+        Assert.EndsWith("\r", command);
+        Assert.DoesNotContain('\n', command);
+        Assert.Contains("-NoLogo -NoProfile -s 2>&1", script);
+        Assert.Contains("JZSTARTCAFE", script);
+        Assert.Contains("\"JZSTOPCAFE\"", script);
 
-    [Fact]
-    public void EncodeHelper_FillsPlaceholdersAndStripsComments()
-    {
-        var script = Encoding.Unicode.GetString(Convert.FromBase64String(Bootstrapper.EncodeHelper("CAFE", 77)));
-        Assert.Contains("$n = 'CAFE'", script);
-        Assert.Contains("$t = 77", script);
-        Assert.DoesNotContain("__NONCE__", script);
-        Assert.DoesNotContain("# Temporary bridge helper", script);
+        // The terminal echoes the typed command; only the printf output may contain the markers.
+        Assert.DoesNotContain("~JZRCAFE~", command);
+        Assert.DoesNotContain("~JZCCAFE~", command);
     }
 }

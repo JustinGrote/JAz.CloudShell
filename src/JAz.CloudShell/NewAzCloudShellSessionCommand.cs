@@ -9,8 +9,8 @@ namespace JAz.CloudShell;
 /// <summary>
 /// <para type="synopsis">Creates a PowerShell remoting session to Azure Cloud Shell.</para>
 /// <para type="description">Authenticates with DefaultAzureCredential, opens an Azure Cloud Shell PowerShell terminal over its
-/// WebSocket, discovers the Cloud Shell PowerShell process ($PID), and bridges a PowerShell remoting session to that process's
-/// named pipe. Use the returned PSSession with Invoke-Command, Enter-PSSession, and Remove-PSSession.</para>
+/// WebSocket, starts PowerShell in server mode (pwsh -s) in that terminal, and carries PowerShell remoting over the
+/// server's stdin and stdout. Use the returned PSSession with Invoke-Command, Enter-PSSession, and Remove-PSSession.</para>
 /// </summary>
 [Cmdlet(VerbsCommon.New, "AzCloudShellSession")]
 [OutputType(typeof(PSSession))]
@@ -53,10 +53,9 @@ public sealed class NewAzCloudShellSessionCommand : PSCmdlet
         try
         {
             PumpMessages(connect, messages, progress);
-            BootstrapResult result;
             try
             {
-                (channel, result) = connect.GetAwaiter().GetResult();
+                channel = connect.GetAwaiter().GetResult();
             }
             catch (OperationCanceledException) when (timeout.IsCancellationRequested)
             {
@@ -65,7 +64,7 @@ public sealed class NewAzCloudShellSessionCommand : PSCmdlet
 
             progress.StatusDescription = "Opening the PowerShell remoting session";
             WriteProgress(progress);
-            var connectionInfo = new AzCloudShellConnectionInfo(channel, result.ProcessId, result.PSVersion);
+            var connectionInfo = new AzCloudShellConnectionInfo(channel);
             runspace = RunspaceFactory.CreateRunspace(connectionInfo, Host, TypeTable.LoadDefaultTypeFiles(), null, Name);
             using var opened = new ManualResetEventSlim();
             runspace.StateChanged += (_, e) =>
@@ -123,7 +122,7 @@ public sealed class NewAzCloudShellSessionCommand : PSCmdlet
             if (!connect.IsCompleted)
             {
                 // Make sure a late-completing connection is not leaked.
-                _ = connect.ContinueWith(t => t.Result.Channel.Dispose(), TaskContinuationOptions.OnlyOnRanToCompletion);
+                _ = connect.ContinueWith(t => t.Result.Dispose(), TaskContinuationOptions.OnlyOnRanToCompletion);
             }
         }
     }
@@ -143,7 +142,7 @@ public sealed class NewAzCloudShellSessionCommand : PSCmdlet
         }
     }
 
-    private async Task<(CloudShellBridgeChannel Channel, BootstrapResult Result)> ConnectAsync(Action<string> log, CancellationToken ct)
+    private async Task<CloudShellBridgeChannel> ConnectAsync(Action<string> log, CancellationToken ct)
     {
         Uri webSocketUri;
         if (WebSocketUriOverride is { } overrideUri)
@@ -163,8 +162,8 @@ public sealed class NewAzCloudShellSessionCommand : PSCmdlet
         var channel = await CloudShellBridgeChannel.ConnectAsync(webSocketUri, ct).ConfigureAwait(false);
         try
         {
-            var result = await Bootstrapper.RunAsync(channel, log, ct).ConfigureAwait(false);
-            return (channel, result);
+            await Bootstrapper.RunAsync(channel, log, ct).ConfigureAwait(false);
+            return channel;
         }
         catch
         {

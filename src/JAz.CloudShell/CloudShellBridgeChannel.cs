@@ -5,80 +5,16 @@ using System.Text.RegularExpressions;
 
 namespace JAz.CloudShell;
 
-/// <summary>Encodes and incrementally parses nonce-scoped bridge frames: <c>~JZ&lt;nonce&gt;|&lt;kind&gt;|&lt;base64&gt;~</c>.</summary>
-internal sealed class FrameParser
-{
-    internal const int MaxFrameLength = 64 * 1024;
-    private readonly string _prefix;
-    private readonly StringBuilder _buffer = new();
-
-    public FrameParser(string nonce) => _prefix = $"~JZ{nonce}|";
-
-    public static string Encode(string nonce, char kind, ReadOnlySpan<byte> payload) =>
-        $"~JZ{nonce}|{kind}|{Convert.ToBase64String(payload)}~\n";
-
-    /// <summary>Appends terminal text and returns every complete frame. Text outside frames is discarded.</summary>
-    public IEnumerable<(char Kind, byte[] Payload)> Feed(string text)
-    {
-        _buffer.Append(text);
-        var results = new List<(char, byte[])>();
-        while (true)
-        {
-            var s = _buffer.ToString();
-            var start = s.IndexOf(_prefix, StringComparison.Ordinal);
-            if (start < 0)
-            {
-                var keep = Math.Min(_prefix.Length - 1, s.Length);
-                _buffer.Clear().Append(s, s.Length - keep, keep);
-                break;
-            }
-
-            var bodyStart = start + _prefix.Length;
-            var end = s.IndexOf('~', bodyStart);
-            if (end < 0)
-            {
-                _buffer.Clear().Append(s, start, s.Length - start);
-                if (_buffer.Length > MaxFrameLength)
-                {
-                    throw new InvalidDataException("A bridge frame exceeded the maximum allowed length.");
-                }
-
-                break;
-            }
-
-            if (end - bodyStart < 2 || s[bodyStart + 1] != '|')
-            {
-                throw new InvalidDataException("Malformed bridge frame received from Cloud Shell.");
-            }
-
-            var kind = s[bodyStart];
-            byte[] payload;
-            try
-            {
-                payload = Convert.FromBase64String(s.Substring(bodyStart + 2, end - bodyStart - 2));
-            }
-            catch (FormatException ex)
-            {
-                throw new InvalidDataException("Corrupt bridge frame payload received from Cloud Shell.", ex);
-            }
-
-            results.Add((kind, payload));
-            _buffer.Clear().Append(s, end + 1, s.Length - end - 1);
-        }
-
-        return results;
-    }
-}
-
 /// <summary>
 /// Full-duplex Cloud Shell terminal WebSocket. Before the bridge is ready it exposes the decoded terminal text
-/// for bootstrap pattern matching; afterwards it carries framed PSRP bytes to and from the remote helper.
+/// for bootstrap pattern matching; afterwards the terminal is a raw pipe to <c>pwsh -s</c>, so every line written is a
+/// PSRP packet for the server's stdin and every line received is a PSRP packet from its stdout.
 /// </summary>
 internal sealed class CloudShellBridgeChannel : IDisposable
 {
-    private const int MaxFramePayload = 768;
-    private const int FramesPerMessage = 4;
+    private const int MaxMessageChars = 3072;
     private const int MaxBootstrapText = 1024 * 1024;
+    private const int MaxDiagnosticLines = 20;
     private const string CursorPositionQuery = "\e[6n";
     private const string CursorPositionReport = "\e[1;1R";
 
@@ -88,20 +24,21 @@ internal sealed class CloudShellBridgeChannel : IDisposable
     private readonly object _sync = new();
     private readonly StringBuilder _text = new();
     private readonly Decoder _wsDecoder = new UTF8Encoding(false).GetDecoder();
-    private readonly Decoder _psrpDecoder = new UTF8Encoding(false).GetDecoder();
-    private readonly StringBuilder _psrpLine = new();
+    private readonly StringBuilder _line = new();
     private readonly List<string> _completedLines = [];
+    private readonly Queue<string> _diagnostics = new();
     private readonly BlockingCollection<string> _lines = new(boundedCapacity: 1024);
+    private readonly TaskCompletionSource _serverExited = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private TaskCompletionSource _signal = new(TaskCreationOptions.RunContinuationsAsynchronously);
-    private FrameParser? _frames;
-    private string? _nonce;
+    private string? _exitMarker;
+    private volatile bool _bridged;
     private Exception? _failure;
     private Action<string>? _onLine;
     private Action<Exception>? _onError;
     private Task? _receiveTask;
     private Thread? _dispatchThread;
     private volatile bool _closing;
-    private volatile bool _remoteClosed;
+    private string? _nonce;
     private int _disposed;
     private string _queryTail = string.Empty;
 
@@ -112,7 +49,14 @@ internal sealed class CloudShellBridgeChannel : IDisposable
 
     /// <summary>Number of cursor position queries received; PSReadLine sends one when it starts reading a prompt.</summary>
     public int CursorQueryCount { get; private set; }
-    public bool IsBridged => _frames is not null;
+
+    public bool IsBridged => _bridged;
+
+    /// <summary>Line that starts forwarding terminal input to the server's stdin.</summary>
+    internal static string StartLine(string nonce) => $"JZSTART{nonce}";
+
+    /// <summary>Line that ends the server's stdin, which shuts the server down.</summary>
+    internal static string StopLine(string nonce) => $"JZSTOP{nonce}";
 
     public static async Task<CloudShellBridgeChannel> ConnectAsync(Uri uri, CancellationToken ct)
     {
@@ -153,7 +97,6 @@ internal sealed class CloudShellBridgeChannel : IDisposable
         try
         {
             ThrowIfFailed();
-
             await _socket.SendAsync(Encoding.UTF8.GetBytes(text), WebSocketMessageType.Text, true, ct).ConfigureAwait(false);
         }
         finally
@@ -203,24 +146,31 @@ internal sealed class CloudShellBridgeChannel : IDisposable
         }
     }
 
-    /// <summary>Switches from terminal text to framed bridge traffic. Text already received is parsed for frames.</summary>
-    public void EnterBridgeMode(string nonce)
+    /// <summary>
+    /// Switches from terminal text to PSRP lines once the server-mode launcher is running, then releases its input
+    /// filter so later lines reach <c>pwsh -s</c>.
+    /// </summary>
+    public async Task EnterBridgeModeAsync(string nonce, CancellationToken ct)
     {
         List<string> ready;
         lock (_sync)
         {
             _nonce = nonce;
-            _frames = new FrameParser(nonce);
+            _exitMarker = $"~JZC{nonce}~";
+            _bridged = true;
             var pending = _text.ToString();
             _text.Clear();
-            ProcessFrames(pending);
+            ProcessOutput(pending);
             ready = TakeCompletedLines();
         }
 
         foreach (var line in ready)
         {
-            _lines.Add(line);
+            _lines.Add(line, ct);
         }
+
+        // The leading newline terminates anything the terminal sent before; the filter discards it.
+        await SendTextAsync($"\n{StartLine(nonce)}\n", ct).ConfigureAwait(false);
     }
 
     /// <summary>Attaches the PSRP transport. Lines are delivered on a dedicated thread in arrival order.</summary>
@@ -246,27 +196,17 @@ internal sealed class CloudShellBridgeChannel : IDisposable
         }
     }
 
-    /// <summary>Sends PSRP text (complete lines) to the remote named pipe. Blocks until written (backpressure).</summary>
+    /// <summary>Sends PSRP text (complete lines) to the server's stdin. Blocks until written (backpressure).</summary>
     public void WriteData(string text)
     {
-        var bytes = Encoding.UTF8.GetBytes(text);
-        var nonce = _nonce ?? throw new InvalidOperationException("Bridge is not ready.");
-        var message = new StringBuilder();
-        var frames = 0;
-        for (var offset = 0; offset < bytes.Length; offset += MaxFramePayload)
+        if (!_bridged)
         {
-            message.Append(FrameParser.Encode(nonce, 'd', bytes.AsSpan(offset, Math.Min(MaxFramePayload, bytes.Length - offset))));
-            if (++frames == FramesPerMessage)
-            {
-                SendTextAsync(message.ToString(), _cts.Token).GetAwaiter().GetResult();
-                message.Clear();
-                frames = 0;
-            }
+            throw new InvalidOperationException("Bridge is not ready.");
         }
 
-        if (message.Length > 0)
+        for (var offset = 0; offset < text.Length; offset += MaxMessageChars)
         {
-            SendTextAsync(message.ToString(), _cts.Token).GetAwaiter().GetResult();
+            SendTextAsync(text.Substring(offset, Math.Min(MaxMessageChars, text.Length - offset)), _cts.Token).GetAwaiter().GetResult();
         }
     }
 
@@ -292,14 +232,16 @@ internal sealed class CloudShellBridgeChannel : IDisposable
                 }
 
                 var text = new string(chars, 0, count);
-
-                var cursorQueries = CountCursorQueries(ref _queryTail, text);
-                CursorQueryCount += cursorQueries;
-                for (var q = 0; q < cursorQueries; q++)
+                if (!_bridged)
                 {
-                    // Behave like a terminal emulator: .NET/PSReadLine on Linux block reading stdin until the
-                    // cursor position report arrives, consuming (and corrupting) anything typed meanwhile.
-                    _ = Task.Run(() => SendTextAsync(CursorPositionReport, _cts.Token)).ContinueWith(t => _ = t.Exception, TaskContinuationOptions.OnlyOnFaulted);
+                    var cursorQueries = CountCursorQueries(ref _queryTail, text);
+                    CursorQueryCount += cursorQueries;
+                    for (var q = 0; q < cursorQueries; q++)
+                    {
+                        // Behave like a terminal emulator: .NET/PSReadLine on Linux block reading stdin until the
+                        // cursor position report arrives, consuming (and corrupting) anything typed meanwhile.
+                        _ = Task.Run(SendCursorPositionReportAsync);
+                    }
                 }
 
                 List<string> ready;
@@ -307,7 +249,7 @@ internal sealed class CloudShellBridgeChannel : IDisposable
                 {
                     LastReceivedUtc = DateTime.UtcNow;
                     HasReceived = true;
-                    if (_frames is null)
+                    if (!_bridged)
                     {
                         _text.Append(text);
                         if (_text.Length > MaxBootstrapText)
@@ -317,7 +259,7 @@ internal sealed class CloudShellBridgeChannel : IDisposable
                     }
                     else
                     {
-                        ProcessFrames(text);
+                        ProcessOutput(text);
                     }
 
                     ready = TakeCompletedLines();
@@ -341,6 +283,30 @@ internal sealed class CloudShellBridgeChannel : IDisposable
         }
     }
 
+    private async Task SendCursorPositionReportAsync()
+    {
+        try
+        {
+            await _sendLock.WaitAsync(_cts.Token).ConfigureAwait(false);
+            try
+            {
+                // Once server mode is running, terminal input is PSRP; a stray report would corrupt it.
+                if (!_bridged && _failure is null)
+                {
+                    await _socket.SendAsync(Encoding.ASCII.GetBytes(CursorPositionReport), WebSocketMessageType.Text, true, _cts.Token).ConfigureAwait(false);
+                }
+            }
+            finally
+            {
+                _sendLock.Release();
+            }
+        }
+        catch
+        {
+            // The receive loop reports connection failures.
+        }
+    }
+
     /// <summary>Counts cursor position queries (DSR 6), including one split across received messages.</summary>
     internal static int CountCursorQueries(ref string tail, string text)
     {
@@ -357,58 +323,44 @@ internal sealed class CloudShellBridgeChannel : IDisposable
     }
 
     // Caller holds _sync.
-    private void ProcessFrames(string text)
+    private void ProcessOutput(string text)
     {
-        foreach (var (kind, payload) in _frames!.Feed(text))
+        foreach (var c in text)
         {
-            switch (kind)
+            if (c != '\n')
             {
-                case 'R':
-                    break;
-                case 'D':
-                    AppendPsrp(payload);
-                    break;
-                case 'E':
-                    FailLocked(new CloudShellException("Bridge", $"The Cloud Shell bridge helper reported an error: {Encoding.UTF8.GetString(payload)}"));
-                    break;
-                case 'C':
-                    // The remote pipe also closes after a normal PSRP close handshake, which can race local cleanup.
-                    // Only report it as a failure if the session is not being closed locally shortly afterwards.
-                    _remoteClosed = true;
-                    _ = Task.Delay(TimeSpan.FromSeconds(3)).ContinueWith(_ =>
-                    {
-                        if (!_closing)
-                        {
-                            Fail(new CloudShellException("Bridge", "The Cloud Shell PowerShell named pipe connection was closed."));
-                        }
-                    }, TaskScheduler.Default);
-                    break;
-                default:
-                    // Lowercase kinds are local->remote frames (e.g. terminal echo); ignore.
-                    break;
+                _line.Append(c);
+                continue;
             }
-        }
-    }
 
-    private void AppendPsrp(byte[] payload)
-    {
-        var chars = new char[_psrpDecoder.GetCharCount(payload, 0, payload.Length, flush: false)];
-        _psrpDecoder.GetChars(payload, 0, payload.Length, chars, 0, flush: false);
-        foreach (var c in chars)
-        {
-            if (c == '\n')
+            if (_line.Length > 0 && _line[^1] == '\r')
             {
-                if (_psrpLine.Length > 0 && _psrpLine[^1] == '\r')
+                _line.Length--;
+            }
+
+            var line = _line.ToString();
+            _line.Clear();
+            if (line.StartsWith('<'))
+            {
+                _completedLines.Add(line);
+            }
+            else if (line.Contains(_exitMarker!, StringComparison.Ordinal))
+            {
+                _serverExited.TrySetResult();
+                if (!_closing)
                 {
-                    _psrpLine.Length--;
+                    var detail = _diagnostics.Count > 0 ? $" Output: {string.Join(" ", _diagnostics)}" : string.Empty;
+                    FailLocked(new CloudShellException("Bridge", $"PowerShell server mode (pwsh -s) in Cloud Shell exited.{detail}"));
                 }
-
-                _completedLines.Add(_psrpLine.ToString());
-                _psrpLine.Clear();
             }
-            else
+            else if (line.Trim().Length > 0)
             {
-                _psrpLine.Append(c);
+                // Server stderr (e.g. a startup failure) shares the stream; keep it for the error message.
+                _diagnostics.Enqueue(line.Trim());
+                if (_diagnostics.Count > MaxDiagnosticLines)
+                {
+                    _diagnostics.Dequeue();
+                }
             }
         }
     }
@@ -493,10 +445,12 @@ internal sealed class CloudShellBridgeChannel : IDisposable
         _closing = true;
         try
         {
-            if (_nonce is { } nonce && _failure is null && !_remoteClosed && _socket.State == WebSocketState.Open)
+            if (_nonce is { } nonce && _failure is null && !_serverExited.Task.IsCompleted && _socket.State == WebSocketState.Open)
             {
+                // End the server's stdin so it exits and the terminal returns to its prompt.
                 using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(2));
-                SendTextAsync(FrameParser.Encode(nonce, 'c', ReadOnlySpan<byte>.Empty), timeout.Token).GetAwaiter().GetResult();
+                SendTextAsync($"\n{StopLine(nonce)}\n", timeout.Token).GetAwaiter().GetResult();
+                _serverExited.Task.Wait(TimeSpan.FromSeconds(3));
             }
 
             if (_socket.State == WebSocketState.Open)
